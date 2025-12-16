@@ -1,4 +1,4 @@
-# https://raw.githubusercontent.com/zertifier/c2d-alghos-sandbox/refs/heads/main/regenag-x/farm_analysis_analytics.extended.py?token=GHSAT0AAAAAAC45ITPUAK6HKJACOYMGBYNU2KBNQEQ
+# https://raw.githubusercontent.com/zertifier/c2d-alghos-sandbox/refs/heads/main/regenag-x/farm_analysis_analytics.extended.py?token=GHSAT0AAAAAAC45ITPVDRUQ5QZR23JR5UJS2KBOCFQ
 import sys
 import subprocess
 import importlib.util

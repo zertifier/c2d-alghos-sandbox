@@ -1,4 +1,4 @@
-// https://raw.githubusercontent.com/zertifier/c2d-alghos-sandbox/refs/heads/main/regenag-x/farm_analysis_analytics.basic.js?token=GHSAT0AAAAAAC45ITPV3GYOCHRQGAR6REOS2KBNOUA
+// https://raw.githubusercontent.com/zertifier/c2d-alghos-sandbox/refs/heads/main/regenag-x/farm_analysis_analytics.basic.js?token=GHSAT0AAAAAAC45ITPVCL6HYZD2DTI5CHBK2KBOBSA
 import fs from "fs";
 import path from "path";
 
