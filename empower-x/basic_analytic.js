@@ -9,12 +9,17 @@ const OUTPUT_FILE = path.join(OUTPUT_DIR, "basic_analysis.json");
    CORE LOGIC
    ========================= */
 
+const parseNum = (val) => {
+    if (val === null || val === undefined || val === "") return 0;
+    const n = parseFloat(val);
+    return isNaN(n) ? 0 : n;
+};
+
 // Schema mapping based on provided table structure:
 // 0: id, 1: created_dt, 2: updated_dt, 3: cups_id, 4: origin, 5: info_dt, 
 // 6: kwh_in, 7: kwh_out, 8: kwh_in_virtual, 9: kwh_out_virtual, 
 // 10: kwh_in_price, 11: kwh_out_price, 12: kwh_in_price_community, 
 // 13: kwh_out_price_community, 14: production, 15: battery, 16: shares, 17: hour_type_range
-
 const COL_IDX = {
     CUPS_ID: 3,
     INFO_DT: 5,
@@ -24,40 +29,66 @@ const COL_IDX = {
     BATTERY: 15
 };
 
-const parseNum = (val) => {
-    if (!val || val === "") return 0;
-    const n = parseFloat(val);
-    return isNaN(n) ? 0 : n;
-};
-
 const processFile = (filePath) => {
     console.log(`Processing file: ${filePath}`);
     const content = fs.readFileSync(filePath, "utf8");
-    const lines = content.split(/\r?\n/).filter(line => line.trim() !== "");
+    
+    try {
+        const rawData = JSON.parse(content);
+        let communities = [];
+        if (rawData && rawData.data && Array.isArray(rawData.data)) {
+            communities = rawData.data;
+        } else if (Array.isArray(rawData)) {
+            communities = rawData;
+        } else if (rawData && rawData.communities && Array.isArray(rawData.communities)) {
+            communities = rawData.communities;
+        } else if (rawData && (rawData.id || rawData.name)) {
+            communities = [rawData];
+        }
 
-    // Check if first line is header? 
-    // The provided sample data didn't show a header row, just data.
-    // We will assume no header or check if first col is UUID-like.
-    // For safety, we process all lines and try to parse.
-
-    const data = [];
-    for (const line of lines) {
-        const cols = line.split(",");
-        if (cols.length < 1) continue; // Skip invalid lines
-
-        // Basic validation - check if cols[0] looks like UUID or similar
-        // if (cols[0].length < 10) continue; 
-
-        data.push({
-            cups_id: cols[COL_IDX.CUPS_ID],
-            date: cols[COL_IDX.INFO_DT],
-            kwh_in: parseNum(cols[COL_IDX.KWH_IN]),
-            kwh_out: parseNum(cols[COL_IDX.KWH_OUT]),
-            production: parseNum(cols[COL_IDX.PRODUCTION]),
-            battery: parseNum(cols[COL_IDX.BATTERY])
+        const records = [];
+        communities.forEach(comm => {
+            if (!comm || !comm.cups) return;
+            comm.cups.forEach(cup => {
+                const energyArray = cup.energy_hourly || cup.energyHourly || [];
+                energyArray.forEach(h => {
+                    records.push({
+                        cups_id: h.cupsId || h.cups_id || cup.id,
+                        date: h.infoDt || h.info_dt,
+                        kwh_in: parseNum(h.kwhIn || h.kwh_in),
+                        kwh_out: parseNum(h.kwhOut || h.kwh_out),
+                        production: parseNum(h.production),
+                        battery: parseNum(h.battery)
+                    });
+                });
+            });
         });
+        return records;
+    } catch (e) {
+        // Fallback to CSV parsing
+        const lines = content.split(/\r?\n/).filter(line => line.trim() !== "");
+        const records = [];
+        for (const line of lines) {
+            const cols = line.split(",");
+            if (cols.length < 7) continue; 
+
+            // Skip header if present
+            if (cols[COL_IDX.CUPS_ID] === "cups_id" || cols[COL_IDX.CUPS_ID] === "cupsId") continue;
+
+            records.push({
+                cups_id: cols[COL_IDX.CUPS_ID],
+                date: cols[COL_IDX.INFO_DT],
+                kwh_in: parseNum(cols[COL_IDX.KWH_IN]),
+                kwh_out: parseNum(cols[COL_IDX.KWH_OUT]),
+                production: parseNum(cols[COL_IDX.PRODUCTION]),
+                battery: parseNum(cols[COL_IDX.BATTERY])
+            });
+        }
+        if (records.length > 0) {
+            console.log(`  -> Successfully parsed as CSV (${records.length} records).`);
+        }
+        return records;
     }
-    return data;
 };
 
 const calculateStats = (records) => {
@@ -118,8 +149,7 @@ try {
         throw new Error(`Input directory ${INPUT_DIR} not found`);
     }
 
-    const files = fs.readdirSync(INPUT_DIR).filter(f => f.endsWith(".csv") || f.endsWith(".txt") || f.indexOf(".") === -1);
-    // Accept standard text files as csv might lack extension in some raw dumps
+    const files = fs.readdirSync(INPUT_DIR).filter(f => !f.startsWith(".") && (f.endsWith(".json") || f.endsWith(".csv") || f.endsWith(".txt") || !f.includes(".")));
 
     console.log(`Found ${files.length} files in input directory.`);
 

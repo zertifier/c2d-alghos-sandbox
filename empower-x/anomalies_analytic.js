@@ -9,16 +9,8 @@ const OUTPUT_FILE = path.join(OUTPUT_DIR, "anomalies_analysis.json");
    CORE LOGIC & UTILS
    ========================= */
 
-const COL_IDX = {
-    CUPS_ID: 3,
-    INFO_DT: 5,
-    KWH_IN: 6,
-    KWH_OUT: 7,
-    PRODUCTION: 14
-};
-
 const parseNum = (val) => {
-    if (!val || val === "") return 0;
+    if (val === null || val === undefined || val === "") return 0;
     const n = parseFloat(val);
     return isNaN(n) ? 0 : n;
 };
@@ -49,32 +41,82 @@ const getStdDev = (values, mean) => {
    DATA PROCESSING
    ========================= */
 
+// Schema mapping based on provided table structure:
+const COL_IDX = {
+    ID: 0,
+    CUPS_ID: 3,
+    INFO_DT: 5,
+    KWH_IN: 6,
+    KWH_OUT: 7,
+    PRODUCTION: 14
+};
+
 const processFile = (filePath) => {
     console.log(`Processing file: ${filePath}`);
     const content = fs.readFileSync(filePath, "utf8");
-    const lines = content.split(/\r?\n/).filter(line => line.trim() !== "");
     
-    const data = [];
-    for (const line of lines) {
-        const cols = line.split(",");
-        if (cols.length < 1) continue;
+    try {
+        const rawData = JSON.parse(content);
+        let communities = [];
+        if (rawData && rawData.data && Array.isArray(rawData.data)) {
+            communities = rawData.data;
+        } else if (Array.isArray(rawData)) {
+            communities = rawData;
+        } else if (rawData && rawData.communities && Array.isArray(rawData.communities)) {
+            communities = rawData.communities;
+        } else if (rawData && (rawData.id || rawData.name)) {
+            communities = [rawData];
+        }
 
-        // Derived Value: Net Consumption = In - Out
-        const kwhIn = parseNum(cols[COL_IDX.KWH_IN]);
-        const kwhOut = parseNum(cols[COL_IDX.KWH_OUT]);
-        const prod = parseNum(cols[COL_IDX.PRODUCTION]);
-        
-        data.push({
-            id: cols[0], // Record ID
-            cups_id: cols[COL_IDX.CUPS_ID],
-            date: cols[COL_IDX.INFO_DT],
-            kwh_in: kwhIn,
-            kwh_out: kwhOut,
-            production: prod,
-            net_usage: kwhIn - kwhOut
+        const records = [];
+        communities.forEach(comm => {
+            if (!comm || !comm.cups) return;
+            comm.cups.forEach(cup => {
+                const energyArray = cup.energy_hourly || cup.energyHourly || [];
+                energyArray.forEach(h => {
+                    const kwhIn = parseNum(h.kwhIn || h.kwh_in);
+                    const kwhOut = parseNum(h.kwhOut || h.kwh_out);
+                    records.push({
+                        id: h.id, // Record ID
+                        cups_id: h.cupsId || h.cups_id || cup.id,
+                        date: h.infoDt || h.info_dt,
+                        kwh_in: kwhIn,
+                        kwh_out: kwhOut,
+                        production: parseNum(h.production),
+                        net_usage: kwhIn - kwhOut
+                    });
+                });
+            });
         });
+        return records;
+    } catch (e) {
+        // Fallback to CSV parsing
+        const lines = content.split(/\r?\n/).filter(line => line.trim() !== "");
+        const records = [];
+        for (const line of lines) {
+            const cols = line.split(",");
+            if (cols.length < 7) continue; 
+
+            // Skip header if present
+            if (cols[COL_IDX.CUPS_ID] === "cups_id" || cols[COL_IDX.CUPS_ID] === "cupsId") continue;
+
+            const kwhIn = parseNum(cols[COL_IDX.KWH_IN]);
+            const kwhOut = parseNum(cols[COL_IDX.KWH_OUT]);
+            records.push({
+                id: cols[COL_IDX.ID],
+                cups_id: cols[COL_IDX.CUPS_ID],
+                date: cols[COL_IDX.INFO_DT],
+                kwh_in: kwhIn,
+                kwh_out: kwhOut,
+                production: parseNum(cols[COL_IDX.PRODUCTION]),
+                net_usage: kwhIn - kwhOut
+            });
+        }
+        if (records.length > 0) {
+            console.log(`  -> Successfully parsed as CSV (${records.length} records).`);
+        }
+        return records;
     }
-    return data;
 };
 
 const detectAnomalies = (records) => {
@@ -149,7 +191,7 @@ try {
         throw new Error(`Input directory ${INPUT_DIR} not found`);
     }
 
-    const files = fs.readdirSync(INPUT_DIR).filter(f => f.endsWith(".csv") || f.endsWith(".txt") || f.indexOf(".") === -1);
+    const files = fs.readdirSync(INPUT_DIR).filter(f => !f.startsWith(".") && (f.endsWith(".json") || f.endsWith(".csv") || f.endsWith(".txt") || !f.includes(".")));
     
     console.log(`Found ${files.length} files in input directory.`);
 
