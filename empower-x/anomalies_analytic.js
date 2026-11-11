@@ -420,7 +420,7 @@ function contextDoc({ title, summary = '', run = [], files = [], fields = [], me
     out.push('');
     out.push('> This file explains the outputs of one Compute-to-Data job of the Empower-X data space, ' +
         'so that an AI assistant (or a person) can answer questions about them. ' +
-        'All numbers below come from this run. Identifiers of supply points (CUPS) and people are shortened for privacy.');
+        'All numbers below come from this run. Where the data contains identifiers of supply points (CUPS), cars or people, they are shortened here for privacy.');
     out.push('');
     out.push('## 1. What this algorithm does'); out.push(''); out.push(mdText(summary)); out.push('');
     out.push('## 2. This run'); out.push(''); out.push(mdTable([{ key: 'label', label: 'Item' }, { key: 'value', label: 'Value' }], run));
@@ -450,6 +450,332 @@ function contextWrite(fsModule, filePath, buildMd) {
     }
 }
 // ===== END html-report =====
+
+/* =========================
+   AI CONTEXT (AI_CONTEXT.md; documentation only, never changes the JSON or HTML)
+   ========================= */
+
+// Re-reads the JSON inputs (read-only) to describe communities and supply-point types.
+function ctxScanCommunities(inputDir, inputLog) {
+    const communities = [];
+    const placeTypes = new Map(); // cups id -> place_type
+    const commOf = new Map(); // cups id -> community name (first one seen)
+    inputLog.forEach((f) => {
+        if (!f.records) return;
+        try {
+            const raw = JSON.parse(fs.readFileSync(path.join(inputDir, f.file), 'utf8'));
+            let list = [];
+            if (raw && Array.isArray(raw.data)) list = raw.data;
+            else if (Array.isArray(raw)) list = raw;
+            else if (raw && Array.isArray(raw.communities)) list = raw.communities;
+            else if (raw && (raw.id || raw.name)) list = [raw];
+            f.format = 'JSON';
+            list.forEach((c) => {
+                if (!c || !c.cups) return;
+                communities.push({ file: f.file, id: c.id, name: c.name, cups: c.cups.length });
+                c.cups.forEach((u) => {
+                    if (!u || u.id === undefined) return;
+                    placeTypes.set(String(u.id), u.place_type || u.placeType || '');
+                    if (!commOf.has(String(u.id))) commOf.set(String(u.id), String(c.name || c.id || ''));
+                });
+            });
+        } catch (e) { f.format = 'CSV'; }
+    });
+    return { communities, placeTypes, commOf };
+}
+
+function buildContext(result, records, inputLog, skippedEntries, generatedAt) {
+    const st = result.statistics.kwh_in;
+    const an = result.anomalies;
+    const spikeThr = an.spikes.threshold;
+    const p99 = an.high_consumption.threshold_p99;
+    const n = records.length;
+    const r4 = (v) => (Number.isFinite(v) ? Math.round(v * 10000) / 10000 : v);
+    const r2 = (v) => (Number.isFinite(v) ? Math.round(v * 100) / 100 : v);
+    const { communities, placeTypes, commOf } = ctxScanCommunities(INPUT_DIR, inputLog);
+    const isSpike = (r) => r.kwh_in > spikeThr;
+    const isZero = (r) => r.kwh_in === 0 && r.kwh_out === 0 && r.production === 0;
+
+    // Per supply point, same numbering as the HTML ("SP n" = order of first appearance).
+    const spIndex = new Map();
+    const per = new Map();
+    const dayTotals = new Map();
+    const seen = new Set();
+    let noDate = 0, dupes = 0, negIn = 0, negOut = 0, nightProd = 0, zeroInNotInactive = 0, zeroInAndExport = 0;
+    let sumIn = 0, sumOut = 0, sumProd = 0;
+    records.forEach((r) => {
+        const id = String(r.cups_id);
+        if (!spIndex.has(id)) spIndex.set(id, spIndex.size + 1);
+        if (!per.has(id)) per.set(id, { id, n: 0, sum: 0, max: -Infinity, maxAt: '', spike: 0, zero: 0, high: 0, exp: 0, out: 0, prod: 0, first: null, last: null, dated: 0, values: [], in0: 0, in0exp: 0, days: new Map() });
+        const s = per.get(id);
+        s.n++; s.sum += r.kwh_in; s.out += r.kwh_out; s.prod += r.production; s.values.push(r.kwh_in);
+        if (r.kwh_in === 0) s.in0++;
+        if (r.kwh_in === 0 && !isZero(r)) s.in0exp++;
+        if (r.kwh_in > s.max) { s.max = r.kwh_in; s.maxAt = r.date; }
+        const zero = isZero(r);
+        if (isSpike(r)) s.spike++;
+        if (zero) s.zero++;
+        if (r.kwh_in >= p99) s.high++;
+        if (r.net_usage < 0) s.exp++;
+        if (r.kwh_in === 0 && !zero) { zeroInNotInactive++; if (r.net_usage < 0) zeroInAndExport++; }
+        sumIn += r.kwh_in; sumOut += r.kwh_out; sumProd += r.production;
+        if (r.kwh_in < 0) negIn++;
+        if (r.kwh_out < 0) negOut++;
+        const ds = r.date ? String(r.date) : '';
+        if (!/^\d{4}-\d{2}-\d{2}/.test(ds)) { noDate++; return; }
+        s.dated++;
+        if (!s.first || ds < s.first) s.first = ds;
+        if (!s.last || ds > s.last) s.last = ds;
+        const day = ds.slice(0, 10);
+        dayTotals.set(day, (dayTotals.get(day) || 0) + r.kwh_in);
+        s.days.set(day, (s.days.get(day) || 0) + r.kwh_in);
+        const key = id + '|' + ds;
+        if (seen.has(key)) dupes++; else seen.add(key);
+        const hh = /[ T](\d{2}):/.exec(ds);
+        if (hh && r.production > 0 && (Number(hh[1]) >= 22 || Number(hh[1]) < 5)) nightProd++;
+    });
+    const sps = [...per.values()];
+    const days = [...dayTotals.keys()].sort();
+    const dated = records.map((r) => (r.date ? String(r.date) : '')).filter((d) => /^\d{4}-\d{2}-\d{2}/.test(d)).sort();
+    const firstTs = dated[0] || '', lastTs = dated[dated.length - 1] || '';
+    const hourMs = (d) => Date.parse(String(d).replace(' ', 'T') + (/[zZ]|[+-]\d\d:?\d\d$/.test(String(d)) ? '' : 'Z'));
+    const spanHours = firstTs && lastTs ? Math.round((hourMs(lastTs) - hourMs(firstTs)) / 3600000) + 1 : 0;
+    let missingHours = 0;
+    sps.forEach((s) => {
+        if (!s.first) return;
+        const exp = Math.round((hourMs(s.last) - hourMs(s.first)) / 3600000) + 1;
+        if (Number.isFinite(exp) && exp > s.dated) missingHours += exp - s.dated;
+    });
+    const spLabel = (id) => `SP ${spIndex.get(String(id))} (${reportMaskId(id)})`;
+    const spsWithSpike = sps.filter((s) => s.spike).length;
+    const spsWithZero = sps.filter((s) => s.zero).length;
+    const ts16 = (d) => (d ? String(d).replace('T', ' ').slice(0, 16) : '-');
+    const placeOf = (id) => placeTypes.get(String(id)) || '';
+    const commName = (id) => commOf.get(String(id)) || '';
+    const spWhere = (id) => [placeOf(id), commName(id) ? 'community "' + commName(id) + '"' : ''].filter(Boolean).join(', ');
+    const spFull = (id) => spLabel(id) + (spWhere(id) ? ' [' + spWhere(id) + ']' : '');
+    sps.forEach((s) => { s.p05 = getPercentile(s.values, 0.05); s.p95 = getPercentile(s.values, 0.95); s.values = null; });
+    // Day share as in the HTML heatmap: that day's import / the supply point's average daily import x 100.
+    const dayPct = (id, ds) => {
+        const s = per.get(String(id));
+        const day = ds ? String(ds).slice(0, 10) : '';
+        if (!s || !s.days.size || !s.days.has(day)) return null;
+        const avg = [...s.days.values()].reduce((a, b) => a + b, 0) / s.days.size;
+        return avg > 0 ? Math.round(s.days.get(day) / avg * 100) : null;
+    };
+    const fmt = (v, d) => (Number.isFinite(v) ? v.toFixed(d) : String(v));
+    // Masked ids shared by several supply points.
+    const maskGroups = new Map();
+    sps.forEach((s) => { const m = reportMaskId(s.id); if (!maskGroups.has(m)) maskGroups.set(m, []); maskGroups.get(m).push('SP ' + spIndex.get(s.id)); });
+    const sharedMasks = [...maskGroups].filter(([, l]) => l.length > 1);
+    // Supply points per community (SP numbers).
+    const commSps = new Map();
+    sps.forEach((s) => { const c = commName(s.id) || '(community unknown)'; if (!commSps.has(c)) commSps.set(c, []); commSps.get(c).push(spIndex.get(s.id)); });
+
+    // Individual flagged readings (as in the HTML "Flagged hours" table).
+    const spikeRecs = records.filter(isSpike).sort((a, b) => b.kwh_in - a.kwh_in);
+    const zeroRecs = records.filter((r) => isZero(r) && !isSpike(r))
+        .sort((a, b) => String(a.cups_id).localeCompare(String(b.cups_id)) || String(a.date).localeCompare(String(b.date)));
+    const zeroRuns = [];
+    zeroRecs.forEach((r) => {
+        const cur = zeroRuns[zeroRuns.length - 1];
+        const prev = cur && cur[cur.length - 1];
+        if (prev && String(prev.cups_id) === String(r.cups_id) && hourMs(r.date) - hourMs(prev.date) === 3600000) cur.push(r);
+        else zeroRuns.push([r]);
+    });
+    const highOnly = records.filter((r) => r.kwh_in >= p99 && !isSpike(r)).sort((a, b) => b.kwh_in - a.kwh_in);
+    const topDays = days.slice().sort((a, b) => dayTotals.get(b) - dayTotals.get(a));
+    const dayGap = topDays.length > 1 ? dayTotals.get(topDays[0]) - dayTotals.get(topDays[1]) : null;
+    const busiestText = topDays.length ? `${topDays[0]}: ${fmt(dayTotals.get(topDays[0]), 2)} kWh` + (topDays.length > 1 ? `; runner-up ${topDays[1]}: ${fmt(dayTotals.get(topDays[1]), 2)} kWh (${fmt(dayGap, 2)} kWh less${dayTotals.get(topDays[0]) && dayGap / dayTotals.get(topDays[0]) < 0.01 ? ', practically a tie' : ''})` : '') : '-';
+    const quietGap = topDays.length > 1 ? dayTotals.get(topDays[topDays.length - 2]) - dayTotals.get(topDays[topDays.length - 1]) : null;
+    const quietestText = topDays.length ? `${topDays[topDays.length - 1]}: ${fmt(dayTotals.get(topDays[topDays.length - 1]), 2)} kWh` + (topDays.length > 1 ? `; next-quietest ${topDays[topDays.length - 2]}: ${fmt(dayTotals.get(topDays[topDays.length - 2]), 2)} kWh (${fmt(quietGap, 2)} kWh more)` : '') : '-';
+    const top5Days = topDays.slice(0, 5).map((d) => `${d} ${fmt(dayTotals.get(d), 2)}`).join('; ');
+    const spsImport0 = sps.filter((s) => s.in0).map((s) => `SP ${spIndex.get(s.id)}${placeOf(s.id) ? ' (' + placeOf(s.id) + ')' : ''}: ${s.in0} h (${s.zero} zero-reading, ${s.in0exp} with export/production)`);
+    const spByMean = sps.slice().sort((a, b) => b.sum / b.n - a.sum / a.n);
+    const spByMax = sps.slice().sort((a, b) => b.max - a.max);
+    const nextMax = records.reduce((m, r) => (!isSpike(r) && r.kwh_in > m ? r.kwh_in : m), 0);
+
+    const J = 'anomalies_analysis.json', H = 'anomalies_analysis.html';
+    const files = [
+        { file: J, format: 'JSON', contents: 'Summary statistics of hourly grid import (kWh) over all supply points together, the two thresholds, and the count of each anomaly type. It does NOT contain individual readings, supply-point ids or per-supply-point figures.' },
+        { file: H, format: 'HTML (self-contained, open in a browser)', contents: 'Visual report: headline counts, anomaly types and rules, flagged hours per supply point, normal range per supply point, daily totals, a daily/weekly heatmap per supply point and a table of the individual flagged readings. Supply-point ids are masked (first 4 + last 4 characters) and numbered "SP n".' }
+    ];
+    const fields = [
+        { file: J, field: 'statistics.kwh_in.mean', type: 'number (full precision)', unit: 'kWh per hour', meaning: 'Average energy imported from the grid in one hourly reading, over all readings of all supply points.' },
+        { file: J, field: 'statistics.kwh_in.std_dev', type: 'number', unit: 'kWh per hour', meaning: 'Population standard deviation (divide by N) of hourly import over all readings; 0 if fewer than 2 readings.' },
+        { file: J, field: 'statistics.kwh_in.percentiles.p01', type: 'number', unit: 'kWh per hour', meaning: '1st percentile of hourly import (linear interpolation between sorted values).' },
+        { file: J, field: 'statistics.kwh_in.percentiles.p05', type: 'number', unit: 'kWh per hour', meaning: '5th percentile; lower edge of the "normal band" in the HTML.' },
+        { file: J, field: 'statistics.kwh_in.percentiles.p95', type: 'number', unit: 'kWh per hour', meaning: '95th percentile; upper edge of the "normal band" in the HTML.' },
+        { file: J, field: 'statistics.kwh_in.percentiles.p99', type: 'number', unit: 'kWh per hour', meaning: '99th percentile; same value as anomalies.high_consumption.threshold_p99.' },
+        { file: J, field: 'anomalies.spikes.threshold', type: 'number', unit: 'kWh per hour', meaning: 'Spike threshold = mean + 3 x std_dev of hourly import.' },
+        { file: J, field: 'anomalies.spikes.count', type: 'integer', unit: 'hourly readings', meaning: 'Number of readings with import strictly greater than the spike threshold.' },
+        { file: J, field: 'anomalies.spikes.sample_ids', type: 'array of record ids (numbers for JSON input, strings for CSV input), at most 5', unit: '-', meaning: 'The "id" field of the first (up to 5) spike readings in the order the data was read, not sorted by size. These are ids of hourly readings, not supply-point ids.' },
+        { file: J, field: 'anomalies.inactivity.count', type: 'integer', unit: 'hourly readings', meaning: 'Readings where import, export and production are all exactly 0 ("zero-reading hours").' },
+        { file: J, field: 'anomalies.inactivity.percentage', type: 'STRING, e.g. "0.73%"', unit: '% of all readings', meaning: 'inactivity.count / total readings x 100, rounded to 2 decimals and stored as text with a % sign (parse it before calculating).' },
+        { file: J, field: 'anomalies.high_consumption.threshold_p99', type: 'number', unit: 'kWh per hour', meaning: '99th percentile of hourly import; readings at or above it are "top 1%" hours.' },
+        { file: J, field: 'anomalies.high_consumption.count', type: 'integer', unit: 'hourly readings', meaning: 'Readings with import >= threshold_p99. Can exceed 1% of readings when values tie; includes the spikes.' },
+        { file: J, field: 'anomalies.net_export_events.count', type: 'integer', unit: 'hourly readings', meaning: 'Readings where export (kwh_out) is greater than import (kwh_in), i.e. net usage < 0. Usually normal solar surplus.' },
+        { file: H, field: 'Summary (KPI tiles)', type: 'text', unit: 'readings / h', meaning: 'Hourly readings analysed (with supply-point and day counts), spike, zero-reading, top 1% and net export counts (same numbers as the JSON).' },
+        { file: H, field: 'Anomaly types: bar chart + "What each type means" table', type: 'chart / table', unit: 'h (hours)', meaning: 'Count per anomaly type and the rule used for each.' },
+        { file: H, field: 'Flagged hours per supply point (chart)', type: 'horizontal bars', unit: 'h (hours)', meaning: 'Per supply point: spikes (red), zero readings (purple), top 1% hours that are not spikes (orange). Top 20 supply points, max 30 bars; net export not shown.' },
+        { file: H, field: 'Normal range charts', type: 'range bars', unit: 'kWh per hour', meaning: 'p05-p95 band and average for all readings and for each supply point (first 20), plus each supply point\'s highest single-hour reading.' },
+        { file: H, field: 'Total daily consumption (chart)', type: 'stacked bars', unit: 'kWh per day', meaning: 'Sum of hourly import of all supply points per calendar day (day = first 10 characters of the timestamp); red = day with a spike, purple = day with zero readings.' },
+        { file: H, field: 'Heatmap', type: 'cells', unit: '% of own daily average', meaning: 'Each supply point\'s daily import / its own average daily import x 100, rounded (weekly averages if the period is over 62 days). Up to 25 supply points.' },
+        { file: H, field: 'Flagged hours table: Supply point, Time, Imported (kWh), Exported (kWh), Type, Record id', type: 'table', unit: 'kWh', meaning: 'Spikes (largest first), then zero-reading periods (consecutive hours of one supply point merged into one row), then up to 10 highest top 1% hours; max 30 rows. Time = timestamp to the minute.' }
+    ];
+
+    const run = [
+        { label: 'Input files found', value: inputLog.length ? inputLog.map((f) => `${f.file}: ${f.error ? 'failed (' + f.error + ')' : f.records + ' hourly readings' + (f.format ? ' (' + f.format + ')' : '')}`).join('; ') : 'none' },
+        { label: 'Input files used (gave readings)', value: inputLog.filter((f) => f.records > 0).map((f) => f.file).join(', ') || 'none' },
+        { label: 'Input files read but with no readings', value: inputLog.filter((f) => !f.error && !f.records).map((f) => f.file + (f.file === 'algoCustomData.json' ? ' (the job parameter file; not energy data, and this algorithm takes no parameters)' : ' (no communities/cups/energy_hourly or CSV rows recognised)')).join('; ') || 'none' },
+        { label: 'Input entries ignored', value: skippedEntries.length ? skippedEntries.join(', ') + ' (hidden, or extension not .json/.csv/.txt/none)' : 'none' },
+        { label: 'Hourly readings analysed', value: String(n) },
+        { label: 'Communities', value: communities.length ? `${communities.length}: ` + communities.map((c) => `${c.name || c.id} (${c.cups} supply points)`).join('; ') : 'not available (CSV input or no community records)' },
+        { label: 'Supply points (CUPS)', value: String(sps.length) },
+        { label: 'Supply points per community (SP numbers)', value: [...commSps].map(([c, l]) => `${c}: SP ${l.join(', ')} (${l.length})`).join('; ') + '. Community names and place types are taken from the input files; they do not appear in the JSON or HTML outputs.' },
+        { label: 'Masked ids shared by several supply points', value: sharedMasks.length ? sharedMasks.map(([m, l]) => `${m} = ${l.join(', ')}`).join('; ') : 'none (all masked ids are unique)' },
+        { label: 'Supply-point types (place_type)', value: (() => { const m = new Map(); sps.forEach((s) => { const t = placeOf(s.id) || 'unknown'; m.set(t, (m.get(t) || 0) + 1); }); return [...m].map(([t, c]) => `${t} ${c}`).join(', '); })() },
+        { label: 'Period covered', value: firstTs ? `${firstTs} to ${lastTs} (${days.length} calendar days, ${spanHours} hours; timestamps as in the source, no time zone stated)` : 'unknown (no valid timestamps)' },
+        { label: 'Parameters', value: 'None. This algorithm reads no algoCustomData; the rules are fixed: spike = import > mean + 3 x standard deviation; top 1% = import >= 99th percentile; zero reading = import, export and production all 0; net export = export > import.' },
+        { label: 'Algorithm version', value: 'not versioned (Empower-X anomalies_analytic.js)' },
+        { label: 'Generated at', value: generatedAt.toISOString() + ' (UTC)' }
+    ];
+
+    const method = [
+        'Input: every hourly reading of every supply point (CUPS) in every input file (JSON communities -> cups -> energy_hourly, or CSV with id in column 1, cups_id in column 4, timestamp in column 6, kwh_in in column 7, kwh_out in column 8, production in column 15). All files are combined into one list; duplicates are not removed.',
+        'Per reading: kwh_in = energy imported from the grid in that hour (kWh); kwh_out = energy exported to the grid (kWh); production = local generation (kWh); net_usage = kwh_in - kwh_out. Missing or non-numeric values count as 0.',
+        'All statistics use kwh_in only and are computed over ALL readings of ALL supply points together (one pooled distribution), not per supply point.',
+        'mean = sum(kwh_in) / N. std_dev = sqrt(sum((kwh_in - mean)^2) / N) (population formula).',
+        'Percentile p: sort the values, pos = (N - 1) x p, value = sorted[floor(pos)] + (pos - floor(pos)) x (sorted[floor(pos)+1] - sorted[floor(pos)]) (linear interpolation).',
+        `Consumption spike: kwh_in > mean + 3 x std_dev (this run: > ${r4(spikeThr)} kWh).`,
+        `Top 1% (high consumption) hour: kwh_in >= p99 (this run: >= ${r4(p99)} kWh). A spike is normally also a top 1% hour; the JSON counts it in both.`,
+        'Zero-reading (inactivity) hour: kwh_in = 0 AND kwh_out = 0 AND production = 0. A reading with kwh_in = 0 but some export or production is NOT counted.',
+        'Net export hour: net_usage < 0, i.e. kwh_out > kwh_in. Listed for information; usually solar surplus, not an error.',
+        'Rounding: inactivity.percentage is rounded to 2 decimals and written as text with "%". All other JSON numbers are unrounded. The HTML shows kWh values rounded to 2 decimals. This file rounds statistics (mean, std_dev, percentiles, thresholds, per-supply-point mean) to 4 decimals and kWh readings, totals and per-supply-point p05/p95 to 2 decimals; trailing zeros are sometimes dropped (1827.8 and 1827.80 are the same value); the Facts block repeats the unrounded JSON values.',
+        'Timestamps are used as given (no time-zone conversion). A day is the first 10 characters of the timestamp (YYYY-MM-DD); consecutive zero-reading hours are merged into one period when exactly 1 hour apart.',
+        'The HTML "Flagged hours per supply point" chart counts a spike once (as spike) and shows only top 1% hours that are not spikes, so its numbers add up differently from the JSON counts. Supply points are numbered "SP n" in order of first appearance in the input, identically in the HTML and in this file.'
+    ];
+
+    const results = [
+        { label: 'Hourly readings analysed', value: n, unit: 'readings' },
+        { label: 'Supply points', value: sps.length, unit: 'CUPS' },
+        { label: 'Calendar days covered', value: days.length, unit: 'days' },
+        { label: 'Total grid import (all readings)', value: r2(sumIn), unit: 'kWh' },
+        { label: 'Total grid export (all readings)', value: r2(sumOut), unit: 'kWh' },
+        { label: 'Total production (all readings)', value: r2(sumProd), unit: 'kWh' },
+        { label: 'Mean hourly import', value: r4(st.mean), unit: 'kWh per hour' },
+        { label: 'Standard deviation of hourly import', value: r4(st.std_dev), unit: 'kWh per hour' },
+        { label: 'p01 / p05 / p95 / p99', value: `${r4(st.percentiles.p01)} / ${r4(st.percentiles.p05)} / ${r4(st.percentiles.p95)} / ${r4(st.percentiles.p99)}`, unit: 'kWh per hour' },
+        { label: 'Spike threshold (mean + 3 sd)', value: r4(spikeThr), unit: 'kWh per hour' },
+        { label: 'Consumption spikes', value: an.spikes.count, unit: `readings (in ${spsWithSpike} supply point${spsWithSpike === 1 ? '' : 's'})` },
+        { label: 'Spike sample record ids (JSON)', value: an.spikes.sample_ids.join(', ') || 'none', unit: 'record id' },
+        { label: 'Zero-reading hours', value: `${an.inactivity.count} (${an.inactivity.percentage})`, unit: `readings (in ${spsWithZero} supply point${spsWithZero === 1 ? '' : 's'}, ${zeroRuns.length} period${zeroRuns.length === 1 ? '' : 's'})` },
+        { label: 'Top 1% consumption hours', value: an.high_consumption.count, unit: 'readings' },
+        { label: 'Net export hours', value: an.net_export_events.count, unit: 'readings' },
+        { label: 'Highest single reading', value: spByMax.length ? `${r2(spByMax[0].max)} at ${spFull(spByMax[0].id)}, ${ts16(spByMax[0].maxAt)}` : '-', unit: 'kWh' },
+        { label: 'Busiest day (all supply points)', value: busiestText, unit: 'kWh' },
+        { label: 'Quietest day (all supply points)', value: quietestText, unit: 'kWh' },
+        { label: 'Top 5 days by total import', value: top5Days || '-', unit: 'kWh' },
+        { label: 'Supply points with hours of 0 import', value: spsImport0.join('; ') || 'none', unit: 'hours' },
+        { label: 'Net export hours per supply point', value: sps.filter((s) => s.exp).map((s) => `SP ${spIndex.get(s.id)}${placeOf(s.id) ? ' (' + placeOf(s.id) + ')' : ''}: ${s.exp}`).join('; ') || 'none', unit: 'hours' }
+    ];
+    spikeRecs.slice(0, 10).forEach((r, i) => results.push({ label: `Spike ${i + 1}`, value: `${spFull(r.cups_id)}, ${ts16(r.date)}, import ${r2(r.kwh_in)} kWh (${spikeThr > 0 ? r2(r.kwh_in / spikeThr) + ' x the spike threshold' : 'above the threshold'}${nextMax > 0 && i === 0 ? '; ' + r2(r.kwh_in / nextMax) + ' x the highest reading that is not a spike, ' + r2(nextMax) + ' kWh' : ''}), export ${r2(r.kwh_out)} kWh, record id ${r.id}; that day SP ${spIndex.get(String(r.cups_id))} imported ${dayPct(r.cups_id, r.date) === null ? '-' : dayPct(r.cups_id, r.date) + '%'} of its own average day (HTML heatmap)`, unit: 'kWh' }));
+    if (spikeRecs.length > 10) results.push({ label: 'More spikes', value: spikeRecs.length - 10, unit: 'not listed' });
+    zeroRuns.slice(0, 15).forEach((g, i) => results.push({ label: `Zero-reading period ${i + 1}`, value: `${spFull(g[0].cups_id)}, ${ts16(g[0].date)}${g.length > 1 ? ' to ' + ts16(g[g.length - 1].date) : ''}, record id${g.length > 1 ? 's ' + g[0].id + ' to ' + g[g.length - 1].id : ' ' + g[0].id}`, unit: `${g.length} h` }));
+    if (zeroRuns.length > 15) results.push({ label: 'More zero-reading periods', value: zeroRuns.length - 15, unit: 'not listed' });
+    highOnly.slice(0, 5).forEach((r, i) => results.push({ label: `Highest top 1% hour that is not a spike, #${i + 1}`, value: `${spLabel(r.cups_id)}, ${ts16(r.date)}, ${r2(r.kwh_in)}, record id ${r.id}`, unit: 'kWh' }));
+    sps.slice(0, 40).forEach((s) => results.push({
+        label: `Per supply point: ${spFull(s.id)}`,
+        value: `${s.n} readings; import total ${r2(s.sum)} kWh, mean ${r4(s.sum / s.n)} kWh/h, normal band p05-p95 ${r2(s.p05)}-${r2(s.p95)} kWh/h, max ${r2(s.max)} kWh (${ts16(s.maxAt)}); export total ${r2(s.out)} kWh; production total ${r2(s.prod)} kWh; spikes ${s.spike}, zero readings ${s.zero}, top 1% ${s.high} (incl. ${s.spike} spike${s.spike === 1 ? '' : 's'}; ${s.high - s.spike} not a spike = the HTML orange bar), net export ${s.exp}`,
+        unit: 'kWh / hours'
+    }));
+    if (sps.length > 40) results.push({ label: 'Per supply point', value: `${sps.length - 40} more supply points not listed`, unit: '' });
+
+    const limitations = [
+        'The JSON output holds only overall statistics and counts (pooled over all supply points). Which supply point, hour or reading was flagged is only in the HTML report and in section 6 of this file, both with masked supply-point ids. No output file contains full CUPS ids.',
+        'Thresholds are pooled over all supply points and all hours, so a reading is "unusual" relative to the whole group, not to that site\'s own normal level. Large sites (e.g. swimming pools) dominate the top 1% and spike lists; a big jump at a small site can go undetected.',
+        'A spike or top 1% hour is a statistical flag, not proof of an error. A zero-reading hour may be a meter/communication outage or a site that is genuinely off.',
+        'The mean + 3 x sd rule assumes a roughly bell-shaped distribution; hourly consumption is skewed, so the spike count is sensitive to a few very large readings.',
+        `p01 = ${r4(st.percentiles.p01)} kWh${st.percentiles.p01 === 0 ? ' (at least 1% of readings import nothing)' : ''}. Readings with import exactly 0, by supply point: ${spsImport0.join('; ') || 'none'}.`,
+        `Readings with import = 0 but some export or production (so NOT counted as zero readings): ${zeroInNotInactive}; of these, ${zeroInAndExport} are also net export hours. This is a different count from anomalies.net_export_events.count (${an.net_export_events.count} = hours with export > import, whatever the import)${zeroInNotInactive === an.net_export_events.count ? '; the two numbers happen to be equal in this run' + (zeroInAndExport === an.net_export_events.count ? ' because every net export hour had 0 import and every 0-import hour with activity exported energy' : '') : ''}.`,
+        `Readings without a valid timestamp: ${noDate}. Duplicate readings (same supply point and timestamp): ${dupes}${dupes ? ' (all counted)' : ''}. Missing hours inside each supply point's own first-to-last period: ${missingHours}.`,
+        `Negative values: import ${negIn}, export ${negOut} readings. Production above 0 between 22:00 and 05:00: ${nightProd} readings${nightProd ? ' (implausible for solar; may be a time-zone or data issue)' : ''}.`,
+        'Timestamps carry no time zone and are used as-is (most likely local Spanish time). Daylight-saving changes are not handled.',
+        'Non-numeric or missing kWh values are silently treated as 0, which can create zero-reading hours that are really missing data.',
+        'Record ids (anomalies.spikes.sample_ids, HTML "Record id") are ids of hourly readings in the source data; they are neither personal data nor supply-point ids.',
+        (() => { const m = new Map(); sps.forEach((x) => m.set(reportMaskId(x.id), (m.get(reportMaskId(x.id)) || 0) + 1)); const dup = [...m].filter(([, c]) => c > 1).length; return dup ? `Masked ids are not unique in this run (${dup} masked id(s) are shared by several supply points; see "Masked ids shared by several supply points" in section 2): always identify a supply point by its "SP n" number, which is the same in the HTML and in this file.` : 'Masked ids are unique in this run, but always prefer the "SP n" number, which is the same in the HTML and in this file.'; })(),
+        'The algorithm cannot explain the cause of an anomaly; it uses no weather, tariff or calendar data and does not judge solar performance.'
+    ];
+
+    const questions = [
+        { question: 'How many anomalies were found?', answer: `anomalies_analysis.json -> anomalies.*.count: spikes ${an.spikes.count}, zero-reading hours ${an.inactivity.count}, top 1% hours ${an.high_consumption.count}, net export hours ${an.net_export_events.count}. Do not simply add them: spikes are also in the top 1% count, and net export is usually normal. Per supply point: section 6.` },
+        { question: 'Which supply points export energy?', answer: `Section 6 "Net export hours per supply point" and the export/production totals in the per-supply-point rows. Net export hours in total: ${an.net_export_events.count}.` },
+        { question: 'What counts as a spike / what was the threshold?', answer: `An hourly import above anomalies.spikes.threshold = mean + 3 x std_dev = ${r4(spikeThr)} kWh (statistics.kwh_in.mean ${r4(st.mean)}, std_dev ${r4(st.std_dev)}).` },
+        { question: 'Which supply point had the spike, and when?', answer: `Not in the JSON (it only has sample record ids). See section 6 of this file ("Spike n") or the HTML "Flagged hours" table; supply points appear as "SP n (ESxx…xxxx)" with masked ids (use the SP number, masked ids repeat). This run: ${spikeRecs.slice(0, 3).map((r) => 'SP ' + spIndex.get(String(r.cups_id)) + ' at ' + ts16(r.date) + ', ' + r2(r.kwh_in) + ' kWh, record id ' + r.id).join('; ') || 'no spikes'}.` },
+        { question: 'Which supply point consumes the most?', answer: `Section 6 "Per supply point" rows: sort by mean hourly import (or by import total when all supply points have the same number of readings). Top 3 by mean hourly import: ${spByMean.slice(0, 3).map((s) => spFull(s.id) + ' ' + r4(s.sum / s.n) + ' kWh/h, total ' + r2(s.sum) + ' kWh').join('; ') || '-'}. The HTML "Highest single-hour reading per supply point" chart shows peaks.` },
+        { question: 'Were there meter outages?', answer: `Zero-reading hours (import, export and production all 0): ${an.inactivity.count} (${an.inactivity.percentage} of readings) in ${zeroRuns.length} period(s); see section 6 "Zero-reading period n", or the purple bars and white heatmap cells in the HTML. Likely outages, but a site could also have been switched off.` },
+        { question: 'What is the normal consumption range?', answer: `90% of hourly readings lie between p05 ${r4(st.percentiles.p05)} and p95 ${r4(st.percentiles.p95)} kWh (statistics.kwh_in.percentiles); the average is ${r4(st.mean)} kWh per hour.` },
+        { question: 'What period and how much data was analysed?', answer: `Section 2 of this file: ${n} hourly readings from ${sps.length} supply points${firstTs ? `, ${firstTs} to ${lastTs}` : ''}.` },
+        { question: 'Why is inactivity.percentage not a number?', answer: 'It is stored as text like "0.73%" (2 decimals). Strip the "%" before calculating, or compute inactivity.count / total readings x 100.' },
+        { question: 'Why is the top 1% count not exactly 1% of the readings?', answer: `1% of ${n} readings is ${r2(n / 100)}. The count (${an.high_consumption.count}) includes every reading equal to or above the p99 value (>=), so ties and the interpolated percentile can add one or more, and the ${an.spikes.count} spike(s) are included too. By supply point: ${sps.filter((s) => s.high).map((s) => 'SP ' + spIndex.get(s.id) + ' ' + s.high).join(', ') || 'none'}.` },
+        { question: 'Which days had the most consumption?', answer: `Section 6 "Busiest day"/"Quietest day", or the HTML daily bar chart (sum of import of all supply points per calendar day). Busiest: ${busiestText}. Quietest: ${quietestText}.` },
+        { question: 'Is net export a problem?', answer: 'Normally not: the site exported more than it imported in that hour, typically solar surplus. It is reported for information only.' },
+        { question: 'Which community / building type had the spike or the outage?', answer: `Section 6 rows "Spike n" and "Zero-reading period n" give the SP number with its place type and community in brackets; section 2 "Supply points per community" lists which SP numbers belong to which community. Spike(s): ${spikeRecs.slice(0, 3).map((r) => spFull(r.cups_id)).join('; ') || 'none'}. Zero readings: ${zeroRuns.slice(0, 3).map((g) => spFull(g[0].cups_id)).join('; ') || 'none'}.` },
+        { question: 'What is normal for a particular supply point?', answer: 'Section 6 "Per supply point" rows give its own p05-p95 band and mean (same values as the HTML "Normal range" chart, which shows the first 20 supply points). The JSON percentiles are for all supply points pooled together, not for one site.' },
+        { question: 'Is the busiest day far ahead of the others?', answer: `Section 6 "Busiest day" gives the runner-up and the difference: ${busiestText}. Top 5 days: ${top5Days || '-'}.` },
+        { question: 'Why does a supply point show "top 1%" in this file but no orange bar in the HTML?', answer: 'The per-supply-point "top 1%" count here includes spikes (as the JSON does). The HTML chart shows a spike only as a red bar and its orange bar counts only top 1% hours that are not spikes; section 6 gives both numbers.' },
+        { question: 'What caused a spike (faulty meter or a real event)?', answer: 'The outputs cannot tell: the algorithm only compares readings with statistical thresholds and uses no weather, tariff, calendar or event data. Section 6 gives how far the reading was above the threshold and how unusual that day was for the site; the data provider can check the reading by its record id.' },
+        { question: 'Can I get the full CUPS id of a flagged supply point?', answer: 'No output file contains full ids; they are masked to the first 4 and last 4 characters. The data provider can identify the reading from the record id shown.' }
+    ];
+
+    const glossary = [
+        { term: 'CUPS', meaning: 'Codigo Universal del Punto de Suministro: the unique id of an electricity supply point (meter) in Spain, e.g. ES0031...; masked in these outputs.' },
+        { term: 'Supply point (SP n)', meaning: 'One metered connection (one CUPS). "SP n" numbers them in order of first appearance in the input, the same in this file and in the HTML.' },
+        { term: 'Energy community', meaning: 'A group of supply points (e.g. municipal buildings) whose data is analysed together.' },
+        { term: 'place_type', meaning: 'Kind of building/use of a supply point in the input (education, office, sports, street_lighting, swimming_pool, healthcare, ...).' },
+        { term: 'kWh', meaning: 'Kilowatt-hour, unit of energy. An hourly reading in kWh equals the average power in kW during that hour.' },
+        { term: 'kwh_in (import)', meaning: 'Energy taken from the grid in the hour.' },
+        { term: 'kwh_out (export)', meaning: 'Energy fed into the grid in the hour (e.g. solar surplus).' },
+        { term: 'production', meaning: 'Energy generated locally (e.g. by solar panels) in the hour.' },
+        { term: 'Net usage', meaning: 'kwh_in - kwh_out; negative means net export.' },
+        { term: 'Mean / standard deviation', meaning: 'Average and typical spread of the hourly import values.' },
+        { term: 'Percentile (p01, p05, p95, p99)', meaning: 'The value below which that share of readings falls; p99 = 99% of readings are at or below it.' },
+        { term: 'Spike', meaning: 'Hourly import more than 3 standard deviations above the average.' },
+        { term: 'Top 1% hour', meaning: 'Hourly import at or above the 99th percentile.' },
+        { term: 'Zero-reading hour (inactivity)', meaning: 'Hour with import, export and production all exactly 0 (possible outage).' },
+        { term: 'Compute-to-Data (C2D)', meaning: 'The data stays with the provider; the algorithm runs next to it and only these output files are returned.' }
+    ];
+
+    const facts = {
+        algorithm: 'Energy Anomaly Detector (anomalies_analytic.js)',
+        generated_at: generatedAt.toISOString(),
+        parameters: { algoCustomData_used: false, spike_rule: 'kwh_in > mean + 3*std_dev', high_rule: 'kwh_in >= p99', zero_rule: 'kwh_in == 0 && kwh_out == 0 && production == 0', net_export_rule: 'kwh_out > kwh_in' },
+        inputs: inputLog.map((f) => ({ file: f.file, records: f.records || 0, error: f.error || null })),
+        readings: n,
+        supply_points: sps.length,
+        communities: communities.length,
+        supply_points_per_community: Object.fromEntries([...commSps].map(([c, l]) => [c, l.map((x) => 'SP ' + x)])),
+        period: { first: firstTs || null, last: lastTs || null, days: days.length },
+        busiest_day: topDays.length ? { day: topDays[0], import_kwh: r2(dayTotals.get(topDays[0])), runner_up: topDays[1] || null, runner_up_kwh: topDays.length > 1 ? r2(dayTotals.get(topDays[1])) : null } : null,
+        quietest_day: topDays.length ? { day: topDays[topDays.length - 1], import_kwh: r2(dayTotals.get(topDays[topDays.length - 1])) } : null,
+        top_supply_point_by_mean: spByMean.length ? { sp: 'SP ' + spIndex.get(spByMean[0].id), place_type: placeOf(spByMean[0].id) || null, mean_kwh_per_hour: r4(spByMean[0].sum / spByMean[0].n), total_kwh: r2(spByMean[0].sum) } : null,
+        spike_readings: spikeRecs.slice(0, 10).map((r) => ({ sp: 'SP ' + spIndex.get(String(r.cups_id)), time: ts16(r.date), kwh_in: r2(r.kwh_in), record_id: r.id })),
+        zero_reading_periods: zeroRuns.slice(0, 15).map((g) => ({ sp: 'SP ' + spIndex.get(String(g[0].cups_id)), from: ts16(g[0].date), to: ts16(g[g.length - 1].date), hours: g.length })),
+        totals_kwh: { import: r2(sumIn), export: r2(sumOut), production: r2(sumProd) },
+        kwh_in: { mean: st.mean, std_dev: st.std_dev, p01: st.percentiles.p01, p05: st.percentiles.p05, p95: st.percentiles.p95, p99: st.percentiles.p99 },
+        spikes: { threshold_kwh: spikeThr, count: an.spikes.count, supply_points: spsWithSpike, sample_ids: an.spikes.sample_ids },
+        zero_readings: { count: an.inactivity.count, percentage: an.inactivity.percentage, periods: zeroRuns.length, supply_points: spsWithZero },
+        top1pct: { threshold_kwh: p99, count: an.high_consumption.count },
+        net_export_hours: an.net_export_events.count,
+        data_quality: { readings_without_timestamp: noDate, duplicate_readings: dupes, missing_hours: missingHours, negative_import: negIn, negative_export: negOut, night_production_readings: nightProd }
+    };
+
+    return contextDoc({
+        title: 'Energy Anomaly Detector',
+        summary: 'Energy Anomaly Detector is a Compute-to-Data algorithm of the Empower-X marketplace. It reads the hourly electricity meter readings of the supply points of one or more energy communities and flags unusual hours: consumption spikes (far above average), the top 1% highest-consumption hours, hours where the meter recorded nothing at all, and hours of net export to the grid. It returns overall statistics and counts (JSON) and a visual report (HTML) showing where and when the flagged hours occurred.',
+        run, files, fields, method, results, limitations, questions, glossary, facts
+    });
+}
 
 /* =========================
    HTML REPORT (presentation only; never changes the JSON)
@@ -921,12 +1247,15 @@ try {
 
     let allRecords = [];
 
+    const inputLog = []; // for AI_CONTEXT.md only
     files.forEach(file => {
         try {
             const records = processFile(path.join(INPUT_DIR, file));
             allRecords = allRecords.concat(records);
+            inputLog.push({ file, records: records.length });
         } catch (err) {
             console.error(`  -> Failed to read ${file}: ${err.message}`);
+            inputLog.push({ file, records: 0, error: err.message });
         }
     });
 
@@ -948,6 +1277,11 @@ try {
     fs.writeFileSync(OUTPUT_FILE, JSON.stringify(result || {}, null, 2));
     console.log(`\n✅ Anomalies analysis written to ${OUTPUT_FILE}`);
     reportWrite(fs, path.join(OUTPUT_DIR, "anomalies_analysis.html"), () => renderReport(result, allRecords, "anomalies_analysis.json"));
+    contextWrite(fs, path.join(OUTPUT_DIR, CONTEXT_FILE), () => {
+        let skipped = [];
+        try { skipped = fs.readdirSync(INPUT_DIR).filter((f) => !files.includes(f)); } catch (e) {}
+        return buildContext(result, allRecords, inputLog, skipped, new Date());
+    });
 
 } catch (error) {
     console.error("❌ Fatal Error:", error.message);

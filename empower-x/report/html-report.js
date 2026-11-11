@@ -416,7 +416,7 @@ function contextDoc({ title, summary = '', run = [], files = [], fields = [], me
     out.push('');
     out.push('> This file explains the outputs of one Compute-to-Data job of the Empower-X data space, ' +
         'so that an AI assistant (or a person) can answer questions about them. ' +
-        'All numbers below come from this run. Identifiers of supply points (CUPS) and people are shortened for privacy.');
+        'All numbers below come from this run. Where the data contains identifiers of supply points (CUPS), cars or people, they are shortened here for privacy.');
     out.push('');
     out.push('## 1. What this algorithm does'); out.push(''); out.push(mdText(summary)); out.push('');
     out.push('## 2. This run'); out.push(''); out.push(mdTable([{ key: 'label', label: 'Item' }, { key: 'value', label: 'Value' }], run));

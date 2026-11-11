@@ -420,7 +420,7 @@ function contextDoc({ title, summary = '', run = [], files = [], fields = [], me
     out.push('');
     out.push('> This file explains the outputs of one Compute-to-Data job of the Empower-X data space, ' +
         'so that an AI assistant (or a person) can answer questions about them. ' +
-        'All numbers below come from this run. Identifiers of supply points (CUPS) and people are shortened for privacy.');
+        'All numbers below come from this run. Where the data contains identifiers of supply points (CUPS), cars or people, they are shortened here for privacy.');
     out.push('');
     out.push('## 1. What this algorithm does'); out.push(''); out.push(mdText(summary)); out.push('');
     out.push('## 2. This run'); out.push(''); out.push(mdTable([{ key: 'label', label: 'Item' }, { key: 'value', label: 'Value' }], run));
@@ -668,8 +668,12 @@ const COL_IDX = {
     BATTERY: 15
 };
 
+// How the last file was read (used only for AI_CONTEXT.md, never for the results).
+let lastParseInfo = null;
+
 const processFile = (filePath) => {
     console.log(`Processing file: ${filePath}`);
+    lastParseInfo = null;
     const content = fs.readFileSync(filePath, "utf8");
     
     try {
@@ -686,8 +690,31 @@ const processFile = (filePath) => {
         }
 
         const records = [];
+        lastParseInfo = { format: "JSON", communities: [], cupsEntries: 0 };
         communities.forEach(comm => {
             if (!comm || !comm.cups) return;
+            if (lastParseInfo) {
+                try {
+                    const n = Array.isArray(comm.cups) ? comm.cups.length : 0;
+                    // Context only: which reading ids belong to this community, and each supply point's place type.
+                    const ids = new Set();
+                    const placeTypes = {};
+                    (Array.isArray(comm.cups) ? comm.cups : []).forEach((cup) => {
+                        if (!cup) return;
+                        const pt = cup.place_type || cup.placeType || null;
+                        const arr = cup.energy_hourly || cup.energyHourly || [];
+                        const own = new Set();
+                        if (Array.isArray(arr)) arr.forEach((h) => { if (h) own.add(String(h.cupsId || h.cups_id || cup.id)); });
+                        if (cup.id !== undefined) own.add(String(cup.id));
+                        own.forEach((id) => {
+                            ids.add(id);
+                            if (pt && !(id in placeTypes)) placeTypes[id] = String(pt);
+                        });
+                    });
+                    lastParseInfo.communities.push({ id: comm.id, name: comm.name, cups: n, ids, placeTypes });
+                    lastParseInfo.cupsEntries += n;
+                } catch (e) { /* context bookkeeping must never affect the results */ }
+            }
             comm.cups.forEach(cup => {
                 const energyArray = cup.energy_hourly || cup.energyHourly || [];
                 energyArray.forEach(h => {
@@ -707,12 +734,13 @@ const processFile = (filePath) => {
         // Fallback to CSV parsing
         const lines = content.split(/\r?\n/).filter(line => line.trim() !== "");
         const records = [];
+        lastParseInfo = { format: "CSV", lines: lines.length, shortLines: 0, headerLines: 0 };
         for (const line of lines) {
             const cols = line.split(",");
-            if (cols.length < 7) continue; 
+            if (cols.length < 7) { lastParseInfo.shortLines++; continue; }
 
             // Skip header if present
-            if (cols[COL_IDX.CUPS_ID] === "cups_id" || cols[COL_IDX.CUPS_ID] === "cupsId") continue;
+            if (cols[COL_IDX.CUPS_ID] === "cups_id" || cols[COL_IDX.CUPS_ID] === "cupsId") { lastParseInfo.headerLines++; continue; }
 
             records.push({
                 cups_id: cols[COL_IDX.CUPS_ID],
@@ -780,6 +808,452 @@ const calculateStats = (records) => {
 };
 
 /* =========================
+   AI CONTEXT (AI_CONTEXT.md; description only, the JSON above is the result)
+   ========================= */
+
+// Plain number for the context text: at most `d` decimals, no thousands separators.
+const ctxNum = (v, d = 3) => {
+    const n = Number(v);
+    if (v === null || v === undefined || !Number.isFinite(n)) return "n/a";
+    return String(Math.round(n * Math.pow(10, d)) / Math.pow(10, d));
+};
+
+function buildContext(stats, records, fileLog) {
+    const agg = aggregateForReport(records);
+    const imp = stats.energy.imported;
+    const prod = stats.energy.production;
+    const generatedAt = new Date().toISOString();
+    const jsonName = path.basename(OUTPUT_FILE);
+    const htmlName = "basic_analysis.html";
+    let htmlWritten = false;
+    try { htmlWritten = fs.existsSync(path.join(OUTPUT_DIR, htmlName)); } catch (e) { htmlWritten = false; }
+
+    // ---- input files ----
+    const usedFiles = fileLog.filter((f) => f.records > 0);
+    const emptyFiles = fileLog.filter((f) => !f.error && f.records === 0);
+    const failedFiles = fileLog.filter((f) => f.error);
+    const fileDesc = (f) => {
+        if (f.error) return `${f.file}: could not be read (${f.error}); skipped`;
+        const i = f.info || {};
+        let how = i.format ? `read as ${i.format}` : "read";
+        if (i.format === "JSON") how += `, ${i.communities.length} communities, ${i.cupsEntries} supply-point entries`;
+        if (i.format === "CSV") how += `, ${i.lines} non-empty lines (${i.headerLines} header, ${i.shortLines} with fewer than 7 columns skipped)`;
+        const why = f.records === 0
+            ? (f.file === "algoCustomData.json" ? " (this is the job's parameter file, it holds no energy data)" : " (no usable energy readings found)")
+            : "";
+        return `${f.file}: ${f.records} readings, ${how}${why}`;
+    };
+    const communities = [];
+    fileLog.forEach((f) => {
+        if (f.info && f.info.format === "JSON") f.info.communities.forEach((c) => communities.push(c));
+    });
+
+    // ---- data checks (computed from the same records) ----
+    let negatives = 0, nightProd = 0, noDate = 0, noHour = 0, bothInOut = 0, batteryNonZero = 0;
+    const pairSeen = new Set();
+    let duplicates = 0;
+    const hoursSeen = new Set();
+    records.forEach((r) => {
+        if (r.kwh_in < 0 || r.kwh_out < 0 || r.production < 0) negatives++;
+        if (r.battery !== 0) batteryNonZero++;
+        if (r.kwh_in > 0 && r.kwh_out > 0) bothInOut++;
+        const key = `${r.cups_id}|${r.date}`;
+        if (pairSeen.has(key)) duplicates++; else pairSeen.add(key);
+        const t = reportTimeParts(r.date);
+        if (!t) { noDate++; return; }
+        if (t.hour === null) { noHour++; return; }
+        hoursSeen.add(t.hour);
+        if (r.production > 0 && (t.hour < 6 || t.hour >= 22)) nightProd++;
+    });
+    const points = agg.points; // sorted by imported, descending
+    const pointsWithProd = points.filter((p) => p.prod > 0).length;
+    const pointsWithExport = points.filter((p) => p.exp > 0).length;
+    const pointsNoImport = points.filter((p) => p.imp === 0).length;
+    const firstDay = agg.dayKeys[0] || null;
+    const lastDay = agg.dayKeys.length ? agg.dayKeys[agg.dayKeys.length - 1] : null;
+    const period = firstDay ? (firstDay === lastDay ? firstDay : `${firstDay} to ${lastDay}`) : "unknown (no parsable timestamps)";
+    const readingsPerPoint = stats.uniqueSensors ? stats.totalRecords / stats.uniqueSensors : 0;
+    const selfSuff = agg.selfSufficiency;
+    const top = points.slice(0, 5);
+    const pointSelf = (p) => {
+        const used = Math.max(0, p.prod - p.exp);
+        const cons = p.imp + used;
+        return cons > 0 ? (used / cons) * 100 : null;
+    };
+    const peakDay = agg.dayKeys.length ? agg.dayKeys.reduce((a, d) => (agg.days.get(d).imp > agg.days.get(a).imp ? d : a), agg.dayKeys[0]) : null;
+    const peakHour = agg.hasProfile
+        ? agg.profile.reduce((best, p, h) => (p && (best === null || p.imp > agg.profile[best].imp) ? h : best), null)
+        : null;
+    const peakProdHour = agg.hasProfile && prod.total > 0
+        ? agg.profile.reduce((best, p, h) => (p && (best === null || p.prod > agg.profile[best].prod) ? h : best), null)
+        : null;
+    const hh = (h) => `${String(h).padStart(2, "0")}:00`;
+
+    // ---- completeness: readings per supply point ----
+    const perPointCount = new Map();
+    records.forEach((r) => { const k = String(r.cups_id); perPointCount.set(k, (perPointCount.get(k) || 0) + 1); });
+    const countVals = [...perPointCount.values()];
+    const minPerPoint = countVals.length ? Math.min(...countVals) : 0;
+    const maxPerPoint = countVals.length ? Math.max(...countVals) : 0;
+    const completeSeries = countVals.length > 0 && minPerPoint === maxPerPoint && maxPerPoint === stats.uniqueTimestamps && duplicates === 0;
+
+    // ---- communities: which supply point belongs where ----
+    const multiComm = communities.length > 1;
+    const scopeTxt = multiComm ? `${communities.length === 2 ? "both" : "all " + communities.length} communities pooled together` : (communities.length === 1 ? "the community" : "all supply points together");
+    const pointComm = new Map();
+    communities.forEach((c) => { (c.ids ? [...c.ids] : []).forEach((id) => { if (!pointComm.has(id)) pointComm.set(id, c.id || c.name || "?"); }); });
+
+    // ---- ranked supply points with masked ids and collision notes ----
+    const ranked = points.map((p, i) => ({ ...p, rank: i + 1, mask: reportMaskId(p.id), self: pointSelf(p), comm: pointComm.get(p.id) || null }));
+    const maskRanks = new Map();
+    ranked.forEach((p) => { if (!maskRanks.has(p.mask)) maskRanks.set(p.mask, []); maskRanks.get(p.mask).push(p.rank); });
+    const sameMaskNote = (p) => {
+        const others = maskRanks.get(p.mask).filter((r) => r !== p.rank);
+        if (!others.length) return "";
+        return ` [NOT the same meter as rank ${others.slice(0, 6).join(", ")}${others.length > 6 ? ` and ${others.length - 6} more` : ""}, which share this masked id]`;
+    };
+    const pctTxt = (v) => (v === null ? "n/a" : ctxNum(v, 1) + " %");
+    const pointLine = (p) => `rank ${p.rank}, ${p.mask}${p.comm && multiComm ? `, community ${p.comm}` : ""}: imported ${ctxNum(p.imp, 1)} kWh, produced ${ctxNum(p.prod, 1)} kWh, exported ${ctxNum(p.exp, 1)} kWh, self-sufficiency ${pctTxt(p.self)}${sameMaskNote(p)}`;
+    const top10 = ranked.slice(0, 10);
+    const hidden = ranked.slice(10);
+    const distinctMasksTop10 = new Set(top10.map((p) => p.mask)).size;
+    const distinctMasksAll = maskRanks.size;
+    const producers = ranked.filter((p) => p.prod > 0);
+    const exporters = ranked.filter((p) => p.exp > 0);
+    const withSelf = ranked.filter((p) => p.self !== null && p.self > 0);
+    const bySelf = withSelf.slice().sort((a, b) => b.self - a.self);
+    const mostSelf = bySelf[0] || null;
+    const byProd = producers.slice().sort((a, b) => b.prod - a.prod);
+    const sumOf = (arr, k) => arr.reduce((s, p) => s + p[k], 0);
+    const rankList = (arr, max = 20) => arr.length ? arr.slice(0, max).map((p) => p.rank).join(", ") + (arr.length > max ? ` and ${arr.length - max} more` : "") : "none";
+
+    // ---- per-community breakdown ----
+    const commStats = communities.map((c) => {
+        const mem = ranked.filter((p) => c.ids && c.ids.has(p.id));
+        const imported = sumOf(mem, "imp"), produced = sumOf(mem, "prod"), exported = sumOf(mem, "exp");
+        const used = Math.max(0, produced - exported);
+        const placeTypes = {};
+        mem.forEach((p) => { const t = c.placeTypes && c.placeTypes[p.id]; if (t) placeTypes[t] = (placeTypes[t] || 0) + 1; });
+        return { id: c.id || "?", name: c.name || "", points: mem.length, imported, produced, exported, self: imported + used > 0 ? (used / (imported + used)) * 100 : null, placeTypes };
+    });
+    const unassigned = ranked.filter((p) => !p.comm);
+
+    // ---- daily ranking and weekday pattern ----
+    const weekdayName = (d) => { const t = Date.parse(d + "T00:00:00Z"); return Number.isFinite(t) ? ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][new Date(t).getUTCDay()] : "?"; };
+    const daysByImp = agg.dayKeys.map((d) => ({ d, imp: agg.days.get(d).imp, prod: agg.days.get(d).prod, exp: agg.days.get(d).exp })).sort((a, b) => b.imp - a.imp);
+    const lowDay = daysByImp.length ? daysByImp[daysByImp.length - 1] : null;
+    const nearTie = daysByImp.length > 1 && daysByImp[0].imp > 0 && (daysByImp[0].imp - daysByImp[1].imp) / daysByImp[0].imp < 0.005;
+    const dayTxt = (x) => `${x.d} (${weekdayName(x.d)}) ${ctxNum(x.imp, 1)} kWh`;
+    let wkAvg = null, weAvg = null;
+    if (agg.dayKeys.length >= 7) {
+        const wk = daysByImp.filter((x) => !["Saturday", "Sunday"].includes(weekdayName(x.d)));
+        const we = daysByImp.filter((x) => ["Saturday", "Sunday"].includes(weekdayName(x.d)));
+        if (wk.length && we.length) { wkAvg = sumOf(wk, "imp") / wk.length; weAvg = sumOf(we, "imp") / we.length; }
+    }
+    const prodDays = daysByImp.filter((x) => x.prod > 0).sort((a, b) => b.prod - a.prod);
+
+    // ---- profile oddities / synthetic-looking data ----
+    const profileNotes = [];
+    let symmetricProd = false;
+    if (peakProdHour !== null) {
+        let pairs = 0, equal = 0;
+        for (let k = 1; k <= 11; k++) {
+            const a = agg.profile[peakProdHour - k], b = agg.profile[peakProdHour + k];
+            if (!a || !b || (a.prod <= 0 && b.prod <= 0)) continue;
+            pairs++;
+            if (Math.abs(a.prod - b.prod) <= 1e-6 * Math.max(a.prod, b.prod, 1)) equal++;
+        }
+        symmetricProd = pairs >= 3 && equal === pairs;
+        if (symmetricProd) profileNotes.push(`The average production profile is exactly symmetric around ${hh(peakProdHour)} (e.g. ${hh(peakProdHour - 1)} and ${hh(peakProdHour + 1)} have identical values). Real solar data is never this regular; the production values look generated or idealised.`);
+    }
+    const importDips = [];
+    if (agg.hasProfile) {
+        for (let h = 1; h < 23; h++) {
+            const a = agg.profile[h - 1], b = agg.profile[h], c = agg.profile[h + 1];
+            if (!a || !b || !c) continue;
+            const nb = (a.imp + c.imp) / 2;
+            if (nb > 0 && b.imp < 0.7 * nb) importDips.push(`${hh(h)} (${ctxNum(b.imp, 1)} kWh vs about ${ctxNum(nb, 1)} kWh at the hours around it)`);
+        }
+        if (importDips.length) profileNotes.push(`Unexplained dip(s) in average grid import at ${importDips.join("; ")}. The data gives no reason (no occupancy, weather or tariff data); it may be an artefact of how the data was generated or recorded.`);
+    }
+    const sampleNames = fileLog.filter((f) => f.records > 0 && /sample|synthetic|demo|test|fake|mock|dummy/i.test(f.file)).map((f) => f.file);
+    const possiblySynthetic = sampleNames.length > 0 || symmetricProd;
+
+    // ---- section 2: this run ----
+    const run = [
+        { label: "Marketplace / data space", value: "Empower-X (Compute-to-Data job)" },
+        { label: "Algorithm", value: `${REPORT_TITLE} (file basic_analytic.js); no version number is recorded in the code` },
+        { label: "Generated at", value: `${generatedAt} (UTC)` },
+        { label: "Input files found", value: `${fileLog.length} (${fileLog.map((f) => f.file).join(", ") || "none"})` },
+        ...fileLog.slice(0, 20).map((f) => ({ label: "Input file", value: fileDesc(f) })),
+        ...(fileLog.length > 20 ? [{ label: "Input file", value: `${fileLog.length - 20} more files not listed` }] : []),
+        { label: "Files that contributed readings", value: `${usedFiles.length}` },
+        { label: "Files skipped / with no readings", value: `${emptyFiles.length + failedFiles.length}` },
+        { label: "Communities found (JSON inputs)", value: communities.length ? `${communities.length}: ` + communities.slice(0, 10).map((c) => `${c.id || "?"} "${c.name || ""}" (${c.cups} supply points)`).join("; ") + (communities.length > 10 ? `; ${communities.length - 10} more` : "") : "none (CSV input or no community wrapper)" },
+        { label: "Readings analysed (totalRecords)", value: `${stats.totalRecords}` },
+        { label: "Distinct supply points (uniqueSensors)", value: `${stats.uniqueSensors}` },
+        { label: "Distinct timestamps (uniqueTimestamps)", value: `${stats.uniqueTimestamps}` },
+        { label: "Average readings per supply point", value: `${ctxNum(readingsPerPoint, 1)} (min ${minPerPoint}, max ${maxPerPoint})` + (completeSeries ? `; every supply point has exactly one reading for each of the ${stats.uniqueTimestamps} timestamps, so the series are complete (no gaps, no duplicates)` : "; supply points do NOT all have one reading per timestamp (gaps or extras, see section 7)") },
+        { label: "Scope of all figures", value: multiComm ? `${communities.length === 2 ? "Both" : "All " + communities.length} communities are POOLED: every total, average, chart and ranking covers all of them together, not one community. Per-community totals are in section 6 (this file only).` : (communities.length === 1 ? "One community." : "All supply points together (no community grouping in the input).") },
+        { label: "Period covered", value: `${period} (${agg.dayKeys.length} calendar days with data; ${hoursSeen.size} distinct hours of day present)` },
+        { label: "Parameters", value: "None. This algorithm takes no parameters; algoCustomData.json (if present) is not read as settings, it is only scanned like any other input file and normally yields 0 readings." }
+    ];
+
+    // ---- section 3: files ----
+    const files = [
+        { file: jsonName, format: "JSON", contents: "The result: record and supply-point counts plus total, average, minimum and maximum of imported and produced energy. Values are not rounded." }
+    ];
+    if (htmlWritten) files.push({ file: htmlName, format: "HTML (self-contained, open in a browser)", contents: "Charts and tables for people: key figures, imported vs produced vs exported energy, self-sufficiency donut, range of single readings, daily totals, average 24-hour profile, top 10 supply points by grid import. Rounded for display; supply-point ids masked." });
+
+    // ---- section 4: fields ----
+    const F = (file, field, type, unit, meaning) => ({ file, field, type, unit, meaning });
+    const fields = [
+        F(jsonName, "totalRecords", "integer", "readings", "Number of readings analysed (one reading = one supply point in one time step, normally one hour), summed over all input files."),
+        F(jsonName, "uniqueSensors", "integer", "supply points", "Number of distinct supply-point ids (CUPS) among the readings."),
+        F(jsonName, "uniqueTimestamps", "integer", "time steps", "Number of distinct timestamp texts (info_dt) among the readings, over all supply points together (for hourly data: number of hours covered)."),
+        F(jsonName, "energy", "object", "", "Container with the two energy flows below."),
+        F(jsonName, "energy.imported", "object", "", "Statistics of kwh_in: electricity taken from the grid."),
+        F(jsonName, "energy.imported.total", "number", "kWh", "Sum of kwh_in over all readings = total energy imported from the grid by all supply points in the period."),
+        F(jsonName, "energy.imported.avg", "number", "kWh per reading", "total / totalRecords = average grid import of one supply point in one hour (not per day, not per supply point)."),
+        F(jsonName, "energy.imported.min", "number", "kWh", "Smallest single reading of kwh_in."),
+        F(jsonName, "energy.imported.max", "number", "kWh", "Largest single reading of kwh_in (one supply point, one hour)."),
+        F(jsonName, "energy.production", "object", "", "Statistics of production: electricity generated locally (solar)."),
+        F(jsonName, "energy.production.total", "number", "kWh", "Sum of production over all readings."),
+        F(jsonName, "energy.production.avg", "number", "kWh per reading", "total / totalRecords (night hours with 0 production are included in the average)."),
+        F(jsonName, "energy.production.min", "number", "kWh", "Smallest single production reading."),
+        F(jsonName, "energy.production.max", "number", "kWh", "Largest single production reading.")
+    ];
+    if (htmlWritten) {
+        fields.push(
+            F(htmlName, "Key figures tiles", "text", "kWh, %, count", "Imported (whole kWh), produced (whole kWh), self-sufficiency (1 decimal %), supply points, readings analysed and distinct time steps."),
+            F(htmlName, "Total energy by flow (bar chart)", "number", "kWh", "Imported, produced and exported totals, rounded to whole kWh. Exported (sum of kwh_out) appears ONLY in the HTML, not in the JSON."),
+            F(htmlName, "Where the consumed energy came from (donut)", "number", "kWh", "Bought from the grid = imported; own production used on site = max(0, produced - exported); whole kWh."),
+            F(htmlName, "Typical hourly readings (range chart)", "number", "kWh", "Min, average, max of a single reading for imported and produced; same values as energy.*.min/avg/max in the JSON."),
+            F(htmlName, "Energy per day (line chart)", "number", "kWh per day", "Daily totals of imported, produced and exported, all supply points together (only if timestamps have a date). With more than 240 days, points are averaged into buckets."),
+            F(htmlName, "Average day / 24-hour profile (line chart)", "number", "kWh per hour", "For each hour of day 00:00-23:00: total of all supply points in that hour, divided by the number of days that have data for that hour."),
+            F(htmlName, "Largest consumers (bar chart + table)", "table", "kWh, %", "Top 10 supply points by grid import. Columns: Supply point (rank + masked id), Imported (kWh), Produced (kWh), Exported (kWh), Self-sufficiency (%); 1 decimal. Ids are masked (first 4 + last 4 characters).")
+        );
+    }
+
+    // ---- section 5: method ----
+    const method = [
+        "Input reading: every file in the input folder whose name ends in .json, .csv, .txt or has no extension (hidden files skipped) is read. JSON is tried first: the communities are taken from data[], a top-level array, communities[], or a single community object; each community's cups[] supply points and their energy_hourly (or energyHourly) readings become records. If the file is not valid JSON it is read as CSV with fixed column positions: 3 cups_id, 5 info_dt, 6 kwh_in, 7 kwh_out, 14 production, 15 battery (lines with fewer than 7 columns and header lines are skipped).",
+        "Field names accepted per reading: cupsId/cups_id (falls back to the supply point's id), infoDt/info_dt, kwhIn/kwh_in, kwhOut/kwh_out, production, battery. Missing, empty or non-numeric values are counted as 0.",
+        "No de-duplication: if the same reading appears twice (e.g. same file given twice), it is counted twice.",
+        "Imported energy total = sum of kwh_in over all readings; average = total / number of readings; min / max = smallest / largest single reading.",
+        "Produced energy total = sum of production over all readings; average, min, max as above.",
+        "Exported energy (HTML only) = sum of kwh_out over all readings.",
+        "Own production used on site (HTML only) = max(0, produced total - exported total), computed on the period totals (not hour by hour).",
+        "Consumption (HTML only) = imported + own production used on site.",
+        "Self-sufficiency (HTML only) = own production used on site / consumption x 100 %. Computed the same way per supply point in the top-10 table.",
+        "uniqueSensors = number of distinct supply-point ids; uniqueTimestamps = number of distinct timestamp texts (not normalised).",
+        "Time: timestamps are used exactly as written in the data (local time of the data source, normally Spain, no time-zone conversion). Day = first 10 characters (YYYY-MM-DD); hour of day = the hour digits after the date.",
+        "Rounding: the JSON keeps full floating-point precision. The HTML rounds: community totals to whole kWh, self-sufficiency to 1 decimal, per-supply-point values to 1 decimal, averages in the range-chart note to 2 decimals. Small differences between the JSON and the HTML are therefore rounding only.",
+        "Ranking of supply points (HTML table and this file) is by imported energy, largest first. The rank is the only reliable way to refer to a supply point, because masked ids repeat.",
+        "Per-community figures (this file only): the readings of each community's supply points are summed; self-sufficiency per community uses the same formula on that community's totals.",
+        "Daily figures: sum of all readings whose timestamp starts with that date. Weekday = calendar weekday of that date. Average per day = imported total / number of days with data.",
+        "24-hour profile: for each hour of day, the sum of all readings in that hour divided by the number of distinct days that have readings in that hour (kWh per hour, all supply points together)."
+    ];
+
+    // ---- section 6: results ----
+    const results = [
+        { label: "Readings analysed", value: `${stats.totalRecords}`, unit: "readings" },
+        { label: "Supply points", value: `${stats.uniqueSensors}`, unit: "supply points" },
+        { label: "Distinct timestamps", value: `${stats.uniqueTimestamps}`, unit: "time steps" },
+        { label: "Period", value: period, unit: "" },
+        { label: "Energy imported from the grid (total)", value: ctxNum(imp.total, 3), unit: "kWh" },
+        { label: "Imported per reading: average / min / max", value: `${ctxNum(imp.avg, 4)} / ${ctxNum(imp.min, 3)} / ${ctxNum(imp.max, 3)}`, unit: "kWh" },
+        { label: "Energy produced locally (total)", value: ctxNum(prod.total, 3), unit: "kWh" },
+        { label: "Produced per reading: average / min / max", value: `${ctxNum(prod.avg, 4)} / ${ctxNum(prod.min, 3)} / ${ctxNum(prod.max, 3)}`, unit: "kWh" },
+        { label: "Energy exported to the grid (HTML only)", value: ctxNum(agg.exported, 3), unit: "kWh" },
+        { label: "Own production used on site (HTML only)", value: ctxNum(agg.selfUsed, 3), unit: "kWh" },
+        { label: "Consumption = imported + used on site (HTML only)", value: ctxNum(agg.consumption, 3), unit: "kWh" },
+        { label: "Self-sufficiency (HTML only)", value: selfSuff === null ? "n/a" : ctxNum(selfSuff, 1), unit: "%" },
+        { label: "Supply points with any production / any export / zero import", value: `${pointsWithProd} / ${pointsWithExport} / ${pointsNoImport}`, unit: "supply points" }
+    ];
+    if (daysByImp.length) {
+        results.push({ label: "Day with highest grid import", value: dayTxt(daysByImp[0]) + (nearTie ? `; near tie with ${dayTxt(daysByImp[1])} (difference ${ctxNum(daysByImp[0].imp - daysByImp[1].imp, 2)} kWh)` : ""), unit: "" });
+        if (daysByImp.length > 2) results.push({ label: "Top 3 days by grid import", value: daysByImp.slice(0, 3).map(dayTxt).join("; "), unit: "" });
+        if (daysByImp.length > 1) results.push({ label: "Day with lowest grid import", value: dayTxt(lowDay), unit: "" });
+        results.push({ label: "Average grid import per day", value: ctxNum(imp.total / daysByImp.length, 1), unit: "kWh per day" });
+        if (wkAvg !== null) results.push({ label: "Average grid import: weekdays (Mon-Fri) / weekend days (Sat-Sun)", value: `${ctxNum(wkAvg, 1)} / ${ctxNum(weAvg, 1)}`, unit: "kWh per day" });
+        if (prodDays.length > 1) results.push({ label: "Day with highest / lowest production", value: `${prodDays[0].d} ${ctxNum(prodDays[0].prod, 1)} kWh / ${prodDays[prodDays.length - 1].d} ${ctxNum(prodDays[prodDays.length - 1].prod, 1)} kWh`, unit: "" });
+    }
+    if (peakHour !== null) results.push({ label: "Hour of day with highest average grid import (all points together)", value: `${hh(peakHour)} (${ctxNum(agg.profile[peakHour].imp, 1)} kWh per hour)`, unit: "" });
+    if (agg.hasProfile) {
+        const lowH = agg.profile.reduce((best, p, h) => (p && (best === null || p.imp < agg.profile[best].imp) ? h : best), null);
+        if (lowH !== null) results.push({ label: "Hour of day with lowest average grid import", value: `${hh(lowH)} (${ctxNum(agg.profile[lowH].imp, 1)} kWh per hour)`, unit: "" });
+    }
+    if (peakProdHour !== null) {
+        const prodHours = agg.profile.map((p, h) => (p && p.prod > 0 ? h : null)).filter((h) => h !== null);
+        results.push({ label: "Hour of day with highest average production", value: `${hh(peakProdHour)} (${ctxNum(agg.profile[peakProdHour].prod, 1)} kWh per hour); production above 0 only from ${hh(prodHours[0])} to ${hh(prodHours[prodHours.length - 1])}`, unit: "" });
+    }
+    commStats.forEach((c) => results.push({
+        label: `Community ${c.id} "${c.name}" (${c.points} supply points${Object.keys(c.placeTypes).length ? "; place types " + Object.entries(c.placeTypes).map(([t, n]) => `${t} ${n}`).join(", ") : ""})`,
+        value: `imported ${ctxNum(c.imported, 1)}, produced ${ctxNum(c.produced, 1)}, exported ${ctxNum(c.exported, 1)}; self-sufficiency ${pctTxt(c.self)}`,
+        unit: "kWh"
+    }));
+    if (communities.length && unassigned.length) results.push({ label: "Supply points not linked to any community", value: `${unassigned.length}`, unit: "supply points" });
+    results.push({ label: "Distinct masked ids", value: `${distinctMasksAll} among ${ranked.length} supply points (${distinctMasksTop10} among the top ${top10.length}). Masked ids are NOT unique: always identify a supply point by its rank.`, unit: "" });
+    top10.forEach((p) => results.push({ label: `Rank ${p.rank} by grid import (as in the HTML table)`, value: pointLine(p), unit: "" }));
+    if (hidden.length) {
+        results.push({ label: `Supply points ranked ${top10.length + 1}-${ranked.length} (NOT shown in the HTML)`, value: `${hidden.length} points: imported ${ctxNum(sumOf(hidden, "imp"), 1)} kWh, produced ${ctxNum(sumOf(hidden, "prod"), 1)} kWh, exported ${ctxNum(sumOf(hidden, "exp"), 1)} kWh; ${hidden.filter((p) => p.prod > 0).length} of them produce(s), ${hidden.filter((p) => p.exp > 0).length} export`, unit: "" });
+        if (hidden.length <= 20) hidden.forEach((p) => results.push({ label: `Rank ${p.rank} (this file only)`, value: pointLine(p), unit: "" }));
+    }
+    results.push({ label: "Supply points with production (ranks)", value: `${producers.length}: ${rankList(producers)}`, unit: "" });
+    results.push({ label: "Supply points with export (ranks)", value: `${exporters.length}: ${rankList(exporters)}`, unit: "" });
+    if (bySelf.length) {
+        results.push({ label: "Most self-sufficient supply point (all points, not only top 10)", value: pointLine(mostSelf), unit: "" });
+        bySelf.slice(1, 5).forEach((p, i) => results.push({ label: `Self-sufficiency rank ${i + 2}`, value: pointLine(p), unit: "" }));
+    } else {
+        results.push({ label: "Most self-sufficient supply point", value: "None: every supply point has 0 % (or n/a) self-sufficiency in this run" + (prod.total === 0 ? " because no production is recorded (see section 7)" : ""), unit: "" });
+    }
+    if (byProd.length && hidden.length > 20) byProd.slice(0, 5).forEach((p, i) => results.push({ label: `Production rank ${i + 1}`, value: pointLine(p), unit: "" }));
+
+    // ---- section 7: limitations ----
+    const limitations = [
+        "The JSON result contains only community-wide counts and statistics. Per-supply-point, per-day, per-hour figures, exported energy and self-sufficiency exist only in the HTML report (and in this file); they cannot be recomputed from the JSON alone.",
+        `Supply-point ids (CUPS) are masked in the HTML and in this file (first 4 + last 4 characters). No output file of this algorithm contains the full ids, so a specific meter (or building) cannot be identified from the outputs. Masked ids are NOT unique: in this run ${ranked.length} supply points have only ${distinctMasksAll} distinct masked ids (${distinctMasksTop10} among the top ${top10.length}). Two lines with the same masked id but different ranks are DIFFERENT meters; always refer to a supply point by its rank (rank = position when sorted by imported kWh, largest first).`,
+        multiComm ? `${communities.length === 2 ? "Both" : "All " + communities.length} communities in the input (${communities.map((c) => c.id).join(", ")}) are pooled: the JSON, the HTML and the headline numbers here describe them together, not one community. Only section 6 of this file splits totals per community.` : "",
+        completeSeries ? `Completeness: every supply point has exactly ${stats.uniqueTimestamps} readings, one per distinct timestamp, so there are no gaps or duplicate readings in this run.` : "",
+        `The "data checks" in this file (duplicates, negatives, night production) are done only to write this description; the algorithm itself does not remove or correct anything. This run: ${duplicates} duplicate supply point + timestamp pairs, ${negatives} readings with negative values, ${nightProd} readings with production at night.`,
+        "Readings are treated as hourly energy in kWh as delivered by the data source; the algorithm does not check the time step. Average per reading is per supply point per time step, not per day.",
+        "Self-sufficiency assumes all exported energy came from local production and is computed on period totals, so it ignores hour-by-hour timing; it is an estimate.",
+        "Battery values are read but not used in any figure. Price fields in the source data are ignored.",
+        "The algorithm does not detect anomalies, fill gaps or remove duplicates; missing readings simply lower the totals.",
+        "The outputs contain no weather, occupancy, building, tariff, price or CO2 data, so they show WHAT happened (when and how much) but not WHY (e.g. why a day or hour was high). Answers about causes can only be hypotheses."
+    ].filter(Boolean);
+    if (possiblySynthetic) limitations.push(`This looks like sample / synthetic data, not real metering${sampleNames.length ? ` (input file name: ${sampleNames.join(", ")})` : ""}${symmetricProd ? "; the production profile is perfectly symmetric" : ""}. Treat the numbers as a demonstration and say so when answering.`);
+    profileNotes.forEach((n) => limitations.push(n));
+    if (nearTie) limitations.push(`The highest-import day (${daysByImp[0].d}) is a near tie with ${daysByImp[1].d}: they differ by only ${ctxNum(daysByImp[0].imp - daysByImp[1].imp, 2)} kWh, which is not a meaningful difference.`);
+    if (exporters.length && hidden.length) {
+        const hp = hidden.filter((p) => p.prod > 0).length, he = hidden.filter((p) => p.exp > 0).length;
+        if (hp || he) limitations.push(`The HTML table shows only the top ${top10.length} supply points by import. ${hp} producing and ${he} exporting supply point(s) are among the ${hidden.length} hidden ones (${ctxNum(sumOf(hidden, "prod"), 1)} kWh produced, ${ctxNum(sumOf(hidden, "exp"), 1)} kWh exported); section 6 of this file covers them.`);
+    }
+    if (failedFiles.length) limitations.push(`${failedFiles.length} input file(s) could not be read and were skipped: ${failedFiles.slice(0, 10).map((f) => f.file).join(", ")}.`);
+    if (emptyFiles.length) limitations.push(`${emptyFiles.length} input file(s) gave no readings: ${emptyFiles.slice(0, 10).map((f) => f.file).join(", ")}${emptyFiles.some((f) => f.file === "algoCustomData.json") ? " (algoCustomData.json is the job's parameter file; that is expected)" : ""}.`);
+    if (prod.total === 0 && agg.exported > 0) limitations.push(`Production is zero in all ${stats.totalRecords} readings although ${ctxNum(agg.exported, 1)} kWh were exported by ${pointsWithExport} supply point(s). The production data is evidently missing from this dataset (exports can only come from local generation). Real local production was at least the exported amount; self-sufficiency is therefore shown as ${selfSuff === null ? "n/a" : ctxNum(selfSuff, 1) + " %"} but is underestimated.`);
+    else if (prod.total === 0) limitations.push("Production is zero in all readings: no local generation is recorded in this dataset (either the supply points have no solar installation or the production data is missing). Self-sufficiency is 0 % for that reason.");
+    else if (agg.exported > prod.total) limitations.push(`Exported energy (${ctxNum(agg.exported, 1)} kWh) is larger than recorded production (${ctxNum(prod.total, 1)} kWh); production is probably incomplete, so own use on site is set to 0 and self-sufficiency is underestimated.`);
+    if (prod.total !== 0 && pointsWithExport > pointsWithProd) limitations.push(`${pointsWithExport} supply points exported energy but only ${pointsWithProd} report any production; production data is incomplete for some supply points.`);
+    if (nightProd) limitations.push(`${nightProd} readings show production above 0 at night (22:00-05:59); this may indicate a time-zone shift (e.g. UTC vs local time) or a non-solar source.`);
+    if (negatives) limitations.push(`${negatives} readings contain negative energy values; they are included as they are (they lower totals and can be the minimum).`);
+    if (duplicates) limitations.push(`${duplicates} readings repeat a supply point + timestamp combination already seen; they were counted twice (no de-duplication).`);
+    if (noDate) limitations.push(`${noDate} readings have no parsable date; they count in the JSON statistics but not in the daily/hourly charts.`);
+    if (noHour) limitations.push(`${noHour} readings have a date but no hour; they count in daily totals but not in the 24-hour profile.`);
+    if (bothInOut) limitations.push(`${bothInOut} readings have both import and export above 0 in the same time step (possible with hourly net metering; not an error).`);
+    if (batteryNonZero) limitations.push(`${batteryNonZero} readings have a non-zero battery value; battery data is not used in any result.`);
+    if (agg.dayKeys.length === 1) limitations.push(`The data covers a single day (${firstDay}); daily trends cannot be shown and all figures describe that one day only. Do not extrapolate to a month or year without saying so.`);
+    if (stats.uniqueSensors && Math.abs(readingsPerPoint - stats.uniqueTimestamps) > 0.5) limitations.push(`Supply points do not all have the same number of readings (on average ${ctxNum(readingsPerPoint, 1)} readings per supply point vs ${stats.uniqueTimestamps} distinct timestamps): some have gaps or extra readings, so totals per supply point are not fully comparable.`);
+
+    // ---- section 8: questions ----
+    const questions = [
+        { question: "How much electricity did the community take from the grid?", answer: `energy.imported.total in ${jsonName}: ${ctxNum(imp.total, 1)} kWh over ${period}, all ${stats.uniqueSensors} supply points together (${scopeTxt}).${multiComm ? " Per-community totals: section 6." : ""}` },
+        { question: "How much solar / local energy was produced?", answer: `energy.production.total in ${jsonName}: ${ctxNum(prod.total, 1)} kWh.${prod.total === 0 ? " It is zero in this run; see section 7 before concluding that nothing was produced." : ""}` },
+        { question: "How much was exported (sold) to the grid?", answer: `Not in the JSON. The HTML bar chart 'Total energy by flow' shows it (whole kWh); the exact value is in section 6 here: ${ctxNum(agg.exported, 1)} kWh.` },
+        { question: "How self-sufficient is the community?", answer: `Self-sufficiency = (produced - exported, at least 0) / (imported + that) x 100 = ${selfSuff === null ? "n/a" : ctxNum(selfSuff, 1) + " %"}. Shown as a KPI tile in the HTML; not in the JSON.` },
+        { question: "Which supply point consumed most from the grid?", answer: `HTML section 'Largest consumers' (top 10, sorted by imported kWh) or section 6 here (same top 10 with ranks). Ids are masked; no output holds the full CUPS ids. Largest: ${top.length ? `rank 1, ${reportMaskId(top[0].id)}, with ${ctxNum(top[0].imp, 1)} kWh` : "n/a"}.` },
+        { question: "Which supply point is the most self-sufficient?", answer: mostSelf ? `Section 6 'Most self-sufficient supply point' (it considers ALL supply points, including those not in the HTML table): rank ${mostSelf.rank}, ${mostSelf.mask}, ${pctTxt(mostSelf.self)}. ${mostSelf.rank <= top10.length ? "It is also in the HTML top-10 table." : "It is NOT in the HTML table, which shows only the top 10 by import."} Do not pick the best value from the HTML table alone.` : `No supply point has self-sufficiency above 0 % in this run${prod.total === 0 ? " (no production recorded)" : ""}.` },
+        { question: "Which supply points have solar production / export energy?", answer: `Section 6: ${producers.length} produce (ranks ${rankList(producers)}), ${exporters.length} export (ranks ${rankList(exporters)}). The HTML shows only those within the top ${top10.length}.` },
+        { question: "Are two lines with the same masked id (e.g. at ranks 3 and 5) the same meter?", answer: "No. Masking keeps only the first 4 and last 4 characters, and many meters share them. Each rank is a different supply point; use the rank, never the masked id, to tell them apart." },
+        ...(multiComm ? [{ question: "How do the communities compare?", answer: `All outputs pool the ${communities.length} communities. Section 6 of this file gives imported, produced, exported and self-sufficiency per community (${commStats.map((c) => `${c.id}: ${c.points} points`).join("; ")}). Which community a ranked supply point belongs to is given in its section 6 line.` }] : []),
+        { question: "Which day had the lowest consumption, and are weekends different?", answer: lowDay && daysByImp.length > 1 ? `Lowest grid import: ${dayTxt(lowDay)}.${wkAvg !== null ? ` Average weekday ${ctxNum(wkAvg, 1)} kWh vs weekend day ${ctxNum(weAvg, 1)} kWh.` : " Too few days to compare weekdays and weekends."} Read the daily values from the HTML chart 'Energy per day'.` : "Only one day (or none) in the data; no comparison is possible." },
+        { question: "Why was a day or hour high?", answer: "The outputs cannot tell: there are no weather, occupancy or building data. Describe the pattern (e.g. weekday vs weekend, evening peak) and say that the cause is not in the data." },
+        { question: "Is this real data?", answer: possiblySynthetic ? "It looks like sample / synthetic data (see section 7); say so when presenting the numbers." : "Nothing in the outputs marks it as sample data, but the outputs cannot prove where the data came from." },
+        { question: "What is the average consumption per supply point?", answer: `Not stored directly. Compute energy.imported.total / uniqueSensors = ${stats.uniqueSensors ? ctxNum(imp.total / stats.uniqueSensors, 2) : "n/a"} kWh per supply point over the period. Note energy.imported.avg (${ctxNum(imp.avg, 4)} kWh) is per reading (one point, one hour), not per supply point.` },
+        { question: "What was the highest hourly import?", answer: `energy.imported.max = ${ctxNum(imp.max, 3)} kWh for one supply point in one hour. Which point and when is not recorded in any output.` },
+        { question: "When in the day is most energy bought / produced?", answer: agg.hasProfile ? `HTML chart 'Average day (24-hour profile)'. Peak average import is at ${hh(peakHour)} (${ctxNum(agg.profile[peakHour].imp, 1)} kWh per hour, all points together).${peakProdHour !== null ? ` Production peaks at ${hh(peakProdHour)} (${ctxNum(agg.profile[peakProdHour].prod, 1)} kWh per hour).` : " No production is recorded, so there is no production peak."}` : "No hour information in the timestamps; the 24-hour profile is not available in this run." },
+        { question: "Which day had the most consumption?", answer: peakDay ? `HTML chart 'Energy per day'. Highest grid import: ${dayTxt(daysByImp[0])}${nearTie ? `, practically tied with ${dayTxt(daysByImp[1])}` : ""}.${agg.dayKeys.length === 1 ? " The data has only this one day." : ""}` : "No dates could be read; no daily figures are available." },
+        { question: "How many hours / days of data are there?", answer: `uniqueTimestamps = ${stats.uniqueTimestamps} distinct time steps across ${agg.dayKeys.length} day(s) (${period}); totalRecords = ${stats.totalRecords} readings.` },
+        { question: "Why do the HTML and the JSON numbers differ slightly?", answer: "Rounding only: the HTML shows whole kWh for totals and 1 decimal per supply point; the JSON is unrounded. Section 5 lists the rounding rules." },
+        { question: "Can I get costs, prices or CO2 savings?", answer: "No. This algorithm ignores prices and does not compute money or CO2; only energy (kWh) statistics are produced." }
+    ];
+
+    const glossary = [
+        { term: "CUPS", meaning: "Código Universal del Punto de Suministro: the unique id of an electricity supply point (meter) in Spain. Treated as personal data, hence masked." },
+        { term: "Supply point / sensor", meaning: "One metered connection (CUPS). 'uniqueSensors' in the JSON counts them." },
+        { term: "Reading / record", meaning: "One line of data: one supply point in one time step (normally one hour)." },
+        { term: "kWh", meaning: "Kilowatt-hour, unit of energy. A reading of 1.5 kWh in an hour means an average power of 1.5 kW during that hour." },
+        { term: "kwh_in / imported", meaning: "Energy taken from the public grid." },
+        { term: "kwh_out / exported / surplus", meaning: "Locally produced energy not used on site and fed into the grid." },
+        { term: "production", meaning: "Energy generated locally, usually by rooftop solar (PV)." },
+        { term: "Self-consumption / own production used on site", meaning: "Produced energy used directly on site = max(0, production - export), on period totals." },
+        { term: "Masked id", meaning: "Shortened supply-point id (first 4 + '…' + last 4 characters). Not unique; the rank identifies the supply point." },
+        { term: "Rank", meaning: "Position of a supply point when all are sorted by imported kWh, largest first (rank 1 = largest grid consumer)." },
+        { term: "Self-sufficiency", meaning: "Share of total consumption covered by own production (%)." },
+        { term: "Energy community", meaning: "Group of supply points (homes, municipal buildings, businesses) that share local generation; the input groups supply points by community." },
+        { term: "PV / kWp", meaning: "Photovoltaic solar; kWp (kilowatt-peak) is the rated size of a solar installation. Not used by this algorithm." },
+        { term: "Compute-to-Data (C2D)", meaning: "The algorithm ran next to the data; only these output files leave the data provider." }
+    ];
+
+    const facts = {
+        algorithm: "basic_analytic.js",
+        title: REPORT_TITLE,
+        generatedAt,
+        parameters: {},
+        inputFiles: fileLog.map((f) => ({ file: f.file, records: f.records, format: f.info ? f.info.format : null, error: f.error || null })),
+        communities: communities.length,
+        totalRecords: stats.totalRecords,
+        uniqueSensors: stats.uniqueSensors,
+        uniqueTimestamps: stats.uniqueTimestamps,
+        periodStart: firstDay,
+        periodEnd: lastDay,
+        days: agg.dayKeys.length,
+        unit: "kWh",
+        importedTotal: imp.total,
+        importedAvgPerReading: imp.avg,
+        importedMin: imp.min,
+        importedMax: imp.max,
+        productionTotal: prod.total,
+        productionAvgPerReading: prod.avg,
+        productionMin: prod.min,
+        productionMax: prod.max,
+        exportedTotal: agg.exported,
+        ownProductionUsedOnSite: agg.selfUsed,
+        consumption: agg.consumption,
+        selfSufficiencyPercent: selfSuff,
+        supplyPointsWithProduction: pointsWithProd,
+        supplyPointsWithExport: pointsWithExport,
+        supplyPointsWithZeroImport: pointsNoImport,
+        productionMissingButExports: prod.total === 0 && agg.exported > 0,
+        nightProductionReadings: nightProd,
+        negativeReadings: negatives,
+        duplicateReadings: duplicates,
+        readingsPerSupplyPointMin: minPerPoint,
+        readingsPerSupplyPointMax: maxPerPoint,
+        completeSeries,
+        communitiesPooled: multiComm,
+        communityBreakdown: commStats.map((c) => ({ id: c.id, supplyPoints: c.points, importedTotal: c.imported, productionTotal: c.produced, exportedTotal: c.exported, selfSufficiencyPercent: c.self })),
+        distinctMaskedIds: distinctMasksAll,
+        mostSelfSufficient: mostSelf ? { rank: mostSelf.rank, maskedId: mostSelf.mask, selfSufficiencyPercent: mostSelf.self } : null,
+        producingSupplyPointRanks: producers.slice(0, 50).map((p) => p.rank),
+        exportingSupplyPointRanks: exporters.slice(0, 50).map((p) => p.rank),
+        peakImportDay: daysByImp.length ? { day: daysByImp[0].d, importedKwh: daysByImp[0].imp } : null,
+        lowestImportDay: lowDay ? { day: lowDay.d, importedKwh: lowDay.imp } : null,
+        peakImportHour: peakHour,
+        peakProductionHour: peakProdHour,
+        possiblySyntheticData: possiblySynthetic,
+        outputFiles: files.map((f) => f.file).concat([CONTEXT_FILE]),
+        keyNotes: {
+            productionMissingButExports: "true when production is 0 everywhere but some energy was exported (production data missing)",
+            nightProductionReadings: "readings with production above 0 between 22:00 and 05:59",
+            negativeReadings: "readings with a negative kwh_in, kwh_out or production value",
+            duplicateReadings: "readings repeating a supply point + timestamp pair (checked for this file only; the algorithm does not de-duplicate)",
+            completeSeries: "true when every supply point has exactly one reading per distinct timestamp",
+            ranks: "rank = position of a supply point sorted by imported kWh, largest first; same as the HTML table",
+            hours: "peak*Hour values are hours of day 0-23 of the average 24-hour profile, local time of the data"
+        }
+    };
+
+    return contextDoc({
+        title: REPORT_TITLE,
+        summary: `This Empower-X Compute-to-Data algorithm reads the hourly smart-meter readings of an energy community (or several) and summarises them: how many readings and supply points (CUPS meters) there are, and the total, average, minimum and maximum of the energy imported from the grid and produced locally (solar). ` +
+            `It writes the statistics to ${jsonName} and, for people, an HTML report with charts that also shows exported energy, self-sufficiency, daily and hourly patterns and the largest consumers. It takes no parameters.`,
+        run, files, fields, method, results, limitations, questions, glossary, facts
+    });
+}
+
+/* =========================
    MAIN EXECUTION
    ========================= */
 
@@ -793,6 +1267,7 @@ try {
     console.log(`Found ${files.length} files in input directory.`);
 
     let allRecords = [];
+    const fileLog = []; // per input file: records loaded / error (for AI_CONTEXT.md only)
 
     files.forEach(file => {
         const p = path.join(INPUT_DIR, file);
@@ -800,8 +1275,10 @@ try {
             const records = processFile(p);
             allRecords = allRecords.concat(records);
             console.log(`  -> Loaded ${records.length} records from ${file}`);
+            fileLog.push({ file, records: records.length, info: lastParseInfo });
         } catch (err) {
             console.error(`  -> Failed to read ${file}: ${err.message}`);
+            fileLog.push({ file, records: 0, error: err && err.message ? err.message : String(err) });
         }
     });
 
@@ -832,6 +1309,7 @@ try {
     fs.writeFileSync(OUTPUT_FILE, JSON.stringify(stats || {}, null, 2));
     console.log(`\n✅ Result successfully written to ${OUTPUT_FILE}`);
     reportWrite(fs, path.join(OUTPUT_DIR, "basic_analysis.html"), () => renderReport(stats, allRecords));
+    contextWrite(fs, path.join(OUTPUT_DIR, CONTEXT_FILE), () => buildContext(stats, allRecords, fileLog));
 
 } catch (error) {
     console.error("❌ Fatal Error:", error.message);

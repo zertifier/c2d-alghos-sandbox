@@ -419,7 +419,7 @@ function contextDoc({ title, summary = '', run = [], files = [], fields = [], me
     out.push('');
     out.push('> This file explains the outputs of one Compute-to-Data job of the Empower-X data space, ' +
         'so that an AI assistant (or a person) can answer questions about them. ' +
-        'All numbers below come from this run. Identifiers of supply points (CUPS) and people are shortened for privacy.');
+        'All numbers below come from this run. Where the data contains identifiers of supply points (CUPS), cars or people, they are shortened here for privacy.');
     out.push('');
     out.push('## 1. What this algorithm does'); out.push(''); out.push(mdText(summary)); out.push('');
     out.push('## 2. This run'); out.push(''); out.push(mdTable([{ key: 'label', label: 'Item' }, { key: 'value', label: 'Value' }], run));
@@ -1410,6 +1410,389 @@ function renderReport(summary, dayRows, p) {
   });
 }
 
+// ---- AI_CONTEXT.md (explains this run's outputs to an AI assistant) ----------
+/** Re-reads algoCustomData.json to tell, per parameter, whether the supplied value or the default was used. Never throws. */
+function inspectParams(p) {
+  const out = { fileFound: false, fileReadable: true, unknown: [], supplied: {} };
+  try {
+    const file = path.join(INPUTS, 'algoCustomData.json');
+    out.fileFound = fs.existsSync(file);
+    let raw = {};
+    if (out.fileFound) {
+      try { raw = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { out.fileReadable = false; raw = {}; }
+    }
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) raw = {};
+    for (const [k, v] of Object.entries(raw)) {
+      const key = k.trim().toLowerCase();
+      if (key in DEFAULTS) out.supplied[key] = v;
+      else {
+        // show only plain characters; markup-like names are flagged, never reproduced
+        const clean = k.replace(/[^A-Za-z0-9_. -]/g, '').trim();
+        const odd = clean !== k.trim();
+        if (odd) out.suspicious = (out.suspicious || 0) + 1;
+        const shown = clean ? (clean.length > 40 ? clean.slice(0, 40) + '…' : clean) : '(no plain characters)';
+        out.unknown.push(odd ? '(a name containing markup/script-like characters; not reproduced here)' : `"${shown}"`);
+      }
+    }
+  } catch (e) { /* listing only */ }
+  const status = {};
+  for (const k of Object.keys(DEFAULTS)) {
+    if (!(k in out.supplied)) { status[k] = 'default (not supplied)'; continue; }
+    const v = out.supplied[k];
+    if (k === 'optimize_tilt' || k === 'hourly_output') {
+      const txt = String(v).slice(0, 20).replace(/[^A-Za-z0-9_.,íÍ -]/g, '');
+      status[k] = 'supplied' + (typeof v === 'boolean' ? '' : ` (given as ${typeof v === 'string' ? `text "${txt}"` : `${typeof v} ${txt}`}, read as ${p[k] ? 'yes' : 'no'})`);
+      continue;
+    }
+    const n = typeof v === 'string' ? parseFloat(v.replace(',', '.')) : Number(v);
+    if (!Number.isFinite(n)) { status[k] = 'supplied but not a number, default used'; continue; }
+    let note = 'supplied';
+    if (typeof v === 'string' && String(n) !== v.trim().replace(',', '.')) note += ' (text, leading number read)';
+    if (k === 'tilt' && n !== p.tilt) note += ' (clamped to 0-90)';
+    if (k === 'azimuth' && n !== p.azimuth) note += ' (normalised to -180..180)';
+    status[k] = note;
+  }
+  return { ...out, status };
+}
+
+function listInputs() {
+  // Inputs are not used except algoCustomData.json; list what was there (names only, capped).
+  const found = [];
+  const walk = (dir, rel, depth) => {
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return; }
+    for (const e of entries) {
+      if (found.length >= 30) return;
+      const name = rel ? rel + '/' + e.name : e.name;
+      if (e.isDirectory()) { if (depth < 3) walk(path.join(dir, e.name), name, depth + 1); } else found.push(name);
+    }
+  };
+  walk(INPUTS, '', 0);
+  return found;
+}
+
+function buildContext({ summary, p, site, res, day }) {
+  const a = summary.annual, opt = summary.optimal_tilt, mon = summary.monthly;
+  const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+  const f = (v, d = 1) => (Number.isFinite(Number(v)) ? Number(v).toFixed(d) : 'n/a');
+  const lat2 = f(p.latitude, 2), lon2 = f(p.longitude, 2);
+  const pi = inspectParams(p);
+  const inputs = listInputs();
+  const others = inputs.filter((n) => n !== 'algoCustomData.json');
+  let outFiles = [];
+  try { outFiles = fs.readdirSync(OUTPUTS).filter((n) => n !== CONTEXT_FILE).sort(); } catch (e) { /* ignore */ }
+  const has = (n) => outFiles.includes(n);
+  const city = (() => { try { return C.nearestCity(p.latitude, p.longitude); } catch (e) { return null; } })();
+  const far = site.nearestKm > 60;
+  const canary = site.utcOffset === 0;
+  const nHours = C.CAL.length;
+
+  // hourly extremes and sunlit hours (same rounding as irradiation_hourly.csv)
+  const stamp = (i) => { const c = C.CAL[i]; return `${C.YEAR}-${String(c.m + 1).padStart(2, '0')}-${String(c.d).padStart(2, '0')}T${String(c.h).padStart(2, '0')}:00`; };
+  let iPoa = 0, iGhi = 0, iTmax = 0, iTmin = 0, sunlit = 0;
+  for (let i = 0; i < nHours; i++) {
+    if (res.poa[i] > res.poa[iPoa]) iPoa = i;
+    if (res.ghi[i] > res.ghi[iGhi]) iGhi = i;
+    if (res.temp[i] > res.temp[iTmax]) iTmax = i;
+    if (res.temp[i] < res.temp[iTmin]) iTmin = i;
+    if (Math.round(res.ghi[i] * 1000) > 0) sunlit++;
+  }
+  // extremes as they appear in irradiation_hourly.csv (rounded), with ties: a smooth typical year repeats the same rounded value on many days
+  const tieInfo = (arr, scale, digits, pick) => {
+    const rv = (i) => (digits === 0 ? Math.round(arr[i] * scale) : Number((arr[i] * scale).toFixed(digits)));
+    let best = rv(0);
+    for (let i = 1; i < nHours; i++) { const v = rv(i); if (pick === 'max' ? v > best : v < best) best = v; }
+    const idx = [];
+    for (let i = 0; i < nHours; i++) if (rv(i) === best) idx.push(i);
+    const hoursSet = [...new Set(idx.map((i) => C.CAL[i].h))];
+    const val = digits === 0 ? String(best) : best.toFixed(digits);
+    const where = idx.length === 1
+      ? `at ${stamp(idx[0])} only`
+      : `first at ${stamp(idx[0])}, last at ${stamp(idx[idx.length - 1])}; the same rounded value occurs in ${idx.length} hours` +
+        (hoursSet.length === 1 ? ` (always at ${String(hoursSet[0]).padStart(2, '0')}:00, on ${idx.length} different days)` : '') +
+        ', so no single date is "the" extreme';
+    return { value: best, text: `${val} ${where}`, first: stamp(idx[0]), count: idx.length };
+  };
+  const xPoa = tieInfo(res.poa, 1000, 0, 'max');
+  const xGhi = tieInfo(res.ghi, 1000, 0, 'max');
+  const xTmax = tieInfo(res.temp, 1, 1, 'max');
+  const xTmin = tieInfo(res.temp, 1, 1, 'min');
+  // daily plane totals (kWh/m²) to show that days within a month differ only smoothly
+  const daily = new Map();
+  C.CAL.forEach((c, i) => { const k = `${c.m}-${c.d}`; daily.set(k, (daily.get(k) || 0) + Math.round(res.poa[i] * 1000) / 1000); }); // as summed from the CSV
+  const dayVal = (m, d) => daily.get(`${m}-${d}`) || 0;
+  const bestIdx = Math.max(0, MONTHS.indexOf(summary.best_month));
+  const bm = { name: MONTH_NAMES[bestIdx], first: dayVal(bestIdx, 1), mid: dayVal(bestIdx, 15), last: dayVal(bestIdx, C.DAYS_IN_MONTH[bestIdx]) };
+  // months where the plane receives less than flat ground
+  const planeVsGhiTxt = f(a.ghi_kwh_m2 > 0 ? (a.plane_kwh_m2 / a.ghi_kwh_m2 - 1) * 100 : 0, 1);
+  const lowerMonths = mon.filter((m) => m.plane_kwh_m2 < m.ghi_kwh_m2);
+  const lowerList = lowerMonths.map((m) => `${m.month} ${m.plane_kwh_m2} vs ${m.ghi_kwh_m2} kWh/m²`).join('; ');
+  const lowerText = lowerMonths.length === 12
+    ? `In every month the panel plane receives less than flat ground (${lowerList}). This is expected for a steep and/or north-facing plane (this run: ${p.tilt}° tilt, azimuth ${p.azimuth}°): it faces away from much of the sun's path and sees only part of the sky.`
+    : `In ${lowerMonths.map((m) => m.month).join(', ')} the panel plane receives less than flat ground (${lowerList}), while the other months gain (annual difference ${planeVsGhiTxt} %). Reason (general solar geometry): in summer the midday sun is very high, so a horizontal surface faces it almost directly, while a tilted plane${Math.abs(p.azimuth) > 10 ? ' that is also turned away from south' : ''} sees it at a larger angle and sees less of the sky; in the other months the lower sun favours the tilt. So the annual gain is not a gain in every month.`;
+  // benchmark from the embedded city data (PVGIS monthly GHI inputs, before modelling)
+  const cityAnnual = C.CITIES.map((c) => ({ n: c.n, v: c.ghi.reduce((s, x) => s + x, 0) })).sort((x, y) => x.v - y.v);
+  const cityMed = cityAnnual.length ? (cityAnnual[(cityAnnual.length - 1) >> 1].v + cityAnnual[cityAnnual.length >> 1].v) / 2 : 0;
+  const pvgisAnnualSite = site.ghi.reduce((s, v) => s + v, 0);
+  const rankBelow = cityAnnual.filter((c) => c.v < pvgisAnnualSite).length;
+  const cityLo = cityAnnual[0] || { n: '-', v: 0 }, cityHi = cityAnnual[cityAnnual.length - 1] || { n: '-', v: 0 };
+  const benchmark = `Annual PVGIS GHI of the ${cityAnnual.length} embedded reference cities ranges from ${f(cityLo.v, 0)} (${cityLo.n}) to ${f(cityHi.v, 0)} kWh/m² (${cityHi.n}), median ${f(cityMed, 0)}; this site's interpolated PVGIS input (${f(pvgisAnnualSite, 0)} kWh/m²) is higher than ${rankBelow} of the ${cityAnnual.length}. General knowledge (not from this data): central Europe (e.g. Germany) gets roughly 1000-1200 kWh/m² GHI per year, so most of Spain is very good for solar.`;
+  // exact coordinates vs rounded
+  const exactEqualsRounded = Number(lat2) === Number(p.latitude) && Number(lon2) === Number(p.longitude);
+  const onCityPoint = C.CITIES.find((c) => c.lat === Number(p.latitude) && c.lon === Number(p.longitude));
+  // parameter corrections actually made
+  const corrections = Object.entries(pi.status).filter(([, s]) => /default used|leading number|clamped|normalised/.test(s)).map(([k, s]) => `${k}: ${s}`);
+  const textBools = Object.entries(pi.status).filter(([, s]) => /read as (yes|no)/.test(s)).map(([k, s]) => `${k}: ${s.replace(/^supplied \(|\)$/g, '')}`);
+
+  // typical day maxima (from the typical_day.csv rows)
+  let tdMax = { v: -1, m: 0, h: 0 }, tdGhiMax = { v: -1, m: 0, h: 0 };
+  day.forEach((row) => {
+    const v = String(row).split(',').map(Number);
+    if (v[5] > tdMax.v) tdMax = { v: v[5], m: v[0], h: v[1] };
+    if (v[2] > tdGhiMax.v) tdGhiMax = { v: v[2], m: v[0], h: v[1] };
+  });
+  const sumMonthsPlane = r(mon.reduce((s, m) => s + m.plane_kwh_m2, 0), 1);
+  const sumMonthsGhi = r(mon.reduce((s, m) => s + m.ghi_kwh_m2, 0), 1);
+  const pvgisAnnual = site.ghi.reduce((s, v) => s + v, 0);
+  const modelVsPvgis = pvgisAnnual > 0 ? (a.ghi_kwh_m2 / pvgisAnnual - 1) * 100 : 0;
+  const planeVsGhi = a.ghi_kwh_m2 > 0 ? (a.plane_kwh_m2 / a.ghi_kwh_m2 - 1) * 100 : 0;
+  const generatedAt = new Date().toISOString();
+  const dir = `${f(p.tilt, 1)}° tilt facing ${compassOf(p.azimuth)} (azimuth ${f(p.azimuth, 1)}°)`;
+
+  const run = [
+    { label: 'Input files used', value: pi.fileFound ? (pi.fileReadable ? 'algoCustomData.json (job parameters); no dataset is needed or read' : 'algoCustomData.json was present but not valid JSON, so it was ignored and all defaults were used') : 'none: algoCustomData.json was not present, so all defaults were used; no dataset is needed or read' },
+    { label: 'Other input files present (ignored)', value: others.length ? `${others.length}${inputs.length >= 30 ? '+' : ''} file(s), e.g. ${others.slice(0, 5).join(', ')}` : 'none' },
+    { label: 'Unknown parameters ignored', value: pi.unknown.length ? `${pi.unknown.length}: ${pi.unknown.slice(0, 8).join(', ')}` : 'none' },
+    { label: 'Site (rounded)', value: `latitude ${lat2}°, longitude ${lon2}° (${pi.status.latitude} / ${pi.status.longitude}); exact values in summary.json → site` },
+    { label: 'Nearest embedded city with PVGIS data', value: city && city.city ? `${city.city.n} (about ${f(city.km, 0)} km)` : 'n/a' },
+    { label: 'Distance to nearest PVGIS data point', value: `${f(site.nearestKm, 1)} km${far ? ' (more than 60 km: results only indicative)' : ''}` },
+    { label: 'Panel plane tilt', value: `${f(p.tilt, 1)}° (${pi.status.tilt}; default ${DEFAULTS.tilt}°)` },
+    { label: 'Panel plane azimuth', value: `${f(p.azimuth, 1)}°, facing ${compassOf(p.azimuth)} (${pi.status.azimuth}; default ${DEFAULTS.azimuth}° = south)` },
+    { label: 'optimize_tilt', value: `${p.optimize_tilt ? 'yes' : 'no'} (${pi.status.optimize_tilt}; default yes)` },
+    { label: 'hourly_output', value: `${p.hourly_output ? 'yes' : 'no'} (${pi.status.hourly_output}; default yes)` },
+    { label: 'Fixed model settings', value: 'ground albedo 0.2; 15-minute sub-steps; clearness index capped at 0.8; no shading or horizon' },
+    { label: 'Period covered', value: `one typical year laid on the ${C.YEAR} calendar: ${nHours} hours (365 days × 24), 1 Jan 00:00 to 31 Dec 23:00 local clock time` },
+    { label: 'Clock time', value: canary ? 'UTC+0 with summer time (+1) from 29 Mar to 24 Oct (Canary Islands rule), although summary.json → timezone says Europe/Madrid' : 'Europe/Madrid: UTC+1, summer time UTC+2 from 29 Mar to 24 Oct ' + C.YEAR },
+    { label: 'Data source', value: summary.site.data },
+    { label: 'Algorithm version', value: `${summary.algorithm} ${summary.version}` },
+    { label: 'Run time', value: `${summary.elapsed_seconds} s` },
+    { label: 'Generated at (UTC)', value: generatedAt },
+  ];
+
+  const files = [
+    { file: 'summary.json', format: 'JSON', contents: 'Site, plane, annual totals, optimal tilt, best/worst month, the 12 monthly rows, calendar and time zone.' },
+    { file: 'monthly.csv', format: 'CSV, comma-separated, header row, 12 data rows', contents: 'Monthly totals (same numbers as summary.json → monthly).' },
+    { file: 'typical_day.csv', format: 'CSV, header row, 288 data rows (12 months × 24 hours)', contents: 'Average irradiance for each hour of the day in each month, and average air temperature.' },
+    { file: 'irradiation_hourly.csv', format: `CSV, header row, ${nHours} data rows`, contents: p.hourly_output ? (has('irradiation_hourly.csv') ? 'Every hour of the typical year: irradiance components and air temperature.' : 'Should have been written but is missing.') : 'NOT written in this run (hourly_output = no).' },
+    { file: 'solar_irradiation_report.html', format: 'HTML (self-contained, open in a browser)', contents: has('solar_irradiation_report.html') ? 'Human-readable report with charts: key figures, month by month, typical day (line chart + heatmap), direct vs diffuse light, settings. Coordinates rounded to 2 decimals.' : 'Not written (report generation failed); the data files are complete.' },
+  ];
+  const extra = outFiles.filter((n) => !files.some((x) => x.file === n));
+  extra.forEach((n) => files.push({ file: n, format: '?', contents: 'Not produced by this algorithm.' }));
+
+  const monthCols = [
+    ['month', 'string', '-', 'Month abbreviation Jan..Dec (in typical_day.csv months are numbers 1-12 instead).'],
+    ['ghi_kwh_m2', 'number (1 decimal)', 'kWh/m²', 'Global horizontal irradiation: total solar energy on flat ground in the month.'],
+    ['dhi_kwh_m2', 'number (1 decimal)', 'kWh/m²', 'Diffuse horizontal irradiation: part of GHI that comes from the sky/clouds, not straight from the sun.'],
+    ['dni_kwh_m2', 'number (1 decimal)', 'kWh/m²', 'Direct normal irradiation: direct sunlight on a surface always facing the sun.'],
+    ['plane_kwh_m2', 'number (1 decimal)', 'kWh/m²', 'Irradiation on the panel plane (tilt/azimuth of this run), incl. direct, diffuse and ground-reflected light.'],
+    ['ghi_daily_kwh_m2', 'number (2 decimals)', 'kWh/m² per day', 'GHI of the month divided by its number of days (Feb = 28).'],
+    ['plane_daily_kwh_m2', 'number (2 decimals)', 'kWh/m² per day', 'Plane irradiation divided by days in month; equals the peak sun hours (h/day) of that month.'],
+    ['mean_temperature_c', 'number (1 decimal)', '°C', 'Mean modelled air temperature over all hours (day and night) of the month.'],
+    ['peak_ghi_w_m2', 'integer', 'W/m²', 'Highest hourly-average GHI of the month (an hourly mean, so lower than instantaneous peaks of ~1000 W/m²).'],
+  ];
+  const fields = [
+    { file: 'summary.json', field: 'algorithm', type: 'string', unit: '-', meaning: 'Algorithm name.' },
+    { file: 'summary.json', field: 'version', type: 'string', unit: '-', meaning: 'Algorithm version.' },
+    { file: 'summary.json', field: 'site.latitude', type: 'number', unit: '° (north +)', meaning: 'Latitude used (full precision).' },
+    { file: 'summary.json', field: 'site.longitude', type: 'number', unit: '° (east +)', meaning: 'Longitude used (full precision).' },
+    { file: 'summary.json', field: 'site.nearest_pvgis_point_km', type: 'number (1 decimal)', unit: 'km', meaning: 'Distance to the closest embedded PVGIS data point (Spain/Andorra grid + cities). Above 60 km results are indicative.' },
+    { file: 'summary.json', field: 'site.data', type: 'string', unit: '-', meaning: 'Description of the data source.' },
+    { file: 'summary.json', field: 'plane.tilt_deg', type: 'number', unit: '°', meaning: 'Panel tilt used: 0 flat, 90 vertical.' },
+    { file: 'summary.json', field: 'plane.azimuth_deg', type: 'number', unit: '°', meaning: 'Panel orientation used: 0 south, -90 east, 90 west, ±180 north.' },
+    { file: 'summary.json', field: 'plane.azimuth_convention', type: 'string', unit: '-', meaning: 'Text reminder of the azimuth convention.' },
+    { file: 'summary.json', field: 'annual.ghi_kwh_m2', type: 'number (integer)', unit: 'kWh/m² per year', meaning: 'Annual global horizontal irradiation (sum of all hours).' },
+    { file: 'summary.json', field: 'annual.dhi_kwh_m2', type: 'number (integer)', unit: 'kWh/m² per year', meaning: 'Annual diffuse horizontal irradiation.' },
+    { file: 'summary.json', field: 'annual.dni_kwh_m2', type: 'number (integer)', unit: 'kWh/m² per year', meaning: 'Annual direct normal irradiation.' },
+    { file: 'summary.json', field: 'annual.plane_kwh_m2', type: 'number (integer)', unit: 'kWh/m² per year', meaning: 'Annual irradiation on the panel plane.' },
+    { file: 'summary.json', field: 'annual.peak_sun_hours_per_day', type: 'number (2 decimals)', unit: 'h/day', meaning: 'Annual plane irradiation / 365: equivalent hours per day at 1000 W/m².' },
+    { file: 'summary.json', field: 'annual.mean_temperature_c', type: 'number (1 decimal)', unit: '°C', meaning: 'Mean modelled air temperature over all 8,760 hours.' },
+    { file: 'summary.json', field: 'annual.diffuse_fraction', type: 'number (3 decimals, 0-1)', unit: 'fraction', meaning: 'Annual DHI / GHI (0.35 = 35 % of the light on flat ground is diffuse).' },
+    { file: 'summary.json', field: 'optimal_tilt', type: 'object or null', unit: '-', meaning: 'Best tilt for the chosen azimuth; null when optimize_tilt was off.' },
+    { file: 'summary.json', field: 'optimal_tilt.tilt_deg', type: 'integer', unit: '°', meaning: 'Tilt (searched 0-90 in 1° steps) giving the most annual plane irradiation; ties go to the lower tilt.' },
+    { file: 'summary.json', field: 'optimal_tilt.azimuth_deg', type: 'number', unit: '°', meaning: 'Azimuth kept fixed during the search (same as plane.azimuth_deg).' },
+    { file: 'summary.json', field: 'optimal_tilt.plane_kwh_m2', type: 'number (integer)', unit: 'kWh/m² per year', meaning: 'Annual plane irradiation at the optimal tilt.' },
+    { file: 'summary.json', field: 'optimal_tilt.gain_vs_selected', type: 'number (3 decimals)', unit: 'fraction', meaning: 'Optimal / selected plane irradiation - 1 (0.052 = 5.2 % more; 0 = the chosen tilt is already optimal).' },
+    { file: 'summary.json', field: 'best_month', type: 'string', unit: '-', meaning: 'Month abbreviation with the highest plane_kwh_m2 (first one on ties).' },
+    { file: 'summary.json', field: 'worst_month', type: 'string', unit: '-', meaning: 'Month abbreviation with the lowest plane_kwh_m2 (first one on ties).' },
+    { file: 'summary.json', field: 'monthly[]', type: 'array of 12 objects (Jan..Dec)', unit: '-', meaning: 'One object per month with exactly the monthly.csv columns below (month, ghi_kwh_m2, …, peak_ghi_w_m2).' },
+    ...monthCols.map(([k, t, u, m]) => ({ file: 'summary.json', field: `monthly[].${k}`, type: t, unit: u, meaning: 'See monthly.csv → ' + k + '.' })),
+    { file: 'summary.json', field: 'calendar_year', type: 'integer', unit: '-', meaning: `Calendar the typical year is laid on (${C.YEAR}); not the year the weather was measured.` },
+    { file: 'summary.json', field: 'timezone', type: 'string', unit: '-', meaning: 'Time basis of all hourly values: local clock time.' },
+    { file: 'summary.json', field: 'elapsed_seconds', type: 'number', unit: 's', meaning: 'Computation time of this job (differs between runs).' },
+    ...monthCols.map(([k, t, u, m]) => ({ file: 'monthly.csv', field: k, type: t, unit: u, meaning: m })),
+    { file: 'typical_day.csv', field: 'month', type: 'integer 1-12', unit: '-', meaning: 'Month number (1 = January).' },
+    { file: 'typical_day.csv', field: 'hour', type: 'integer 0-23', unit: 'h (local clock)', meaning: 'Hour of the day; 12 means 12:00-12:59.' },
+    { file: 'typical_day.csv', field: 'ghi_w_m2', type: 'integer', unit: 'W/m² (= Wh/m² in that hour)', meaning: 'Average GHI in that hour over all days of the month.' },
+    { file: 'typical_day.csv', field: 'dhi_w_m2', type: 'integer', unit: 'W/m²', meaning: 'Average diffuse horizontal irradiance in that hour.' },
+    { file: 'typical_day.csv', field: 'dni_w_m2', type: 'integer', unit: 'W/m²', meaning: 'Average direct normal irradiance in that hour.' },
+    { file: 'typical_day.csv', field: 'plane_w_m2', type: 'integer', unit: 'W/m²', meaning: 'Average irradiance on the panel plane in that hour.' },
+    { file: 'typical_day.csv', field: 'temperature_c', type: 'number (1 decimal)', unit: '°C', meaning: 'Average modelled air temperature in that hour.' },
+    ...(p.hourly_output ? [
+      { file: 'irradiation_hourly.csv', field: 'local_datetime', type: 'text YYYY-MM-DDTHH:00', unit: 'local clock time', meaning: `Start of the hour, on the ${C.YEAR} calendar; no seconds, no time-zone suffix.` },
+      { file: 'irradiation_hourly.csv', field: 'ghi_w_m2', type: 'integer', unit: 'W/m² (= Wh/m² in that hour)', meaning: 'Mean global horizontal irradiance during the hour.' },
+      { file: 'irradiation_hourly.csv', field: 'dhi_w_m2', type: 'integer', unit: 'W/m²', meaning: 'Mean diffuse horizontal irradiance during the hour.' },
+      { file: 'irradiation_hourly.csv', field: 'dni_w_m2', type: 'integer', unit: 'W/m²', meaning: 'Mean direct normal irradiance during the hour.' },
+      { file: 'irradiation_hourly.csv', field: 'plane_w_m2', type: 'integer', unit: 'W/m²', meaning: 'Mean irradiance on the panel plane during the hour.' },
+      { file: 'irradiation_hourly.csv', field: 'temperature_c', type: 'number (1 decimal)', unit: '°C', meaning: 'Modelled air temperature (hour mean).' },
+    ] : []),
+    { file: 'solar_irradiation_report.html', field: '(page)', type: 'HTML', unit: '-', meaning: 'Visual copy of the figures above; not meant for machine reading.' },
+  ];
+
+  const method = [
+    `Location data: the monthly GHI and monthly mean air temperature for the site are interpolated (inverse distance squared) from the 4 nearest embedded PVGIS points (long-term 2011-2020 averages, SARAH-2 satellite data; grid over Spain and Andorra plus ${C.CITIES.length} cities). If a point is closer than 1 km its values are used directly. Solar geometry uses the exact coordinates.`,
+    'Monthly to hourly: the monthly clearness index Kt = monthly GHI / extraterrestrial irradiation of the month (capped at 0.8) gives the daily GHI of each day; the daily diffuse part comes from the Erbs correlation; daily values are spread over the hours with the Collares-Pereira & Rabl (total) and Liu-Jordan (diffuse) profiles, evaluated in 4 sub-steps of 15 minutes per hour.',
+    'DNI: in each 15-minute sub-step the beam part (GHI - DHI) is divided by cos(solar zenith) of that sub-step, with cos(zenith) floored at 0.087 (sun at least ~5° high) to avoid huge values at sunrise/sunset; the 4 sub-steps are then averaged into the hour. Because of this, recomputing (ghi_w_m2 - dhi_w_m2) / cos(zenith) from hourly CSV columns does NOT exactly reproduce dni_w_m2; use the dni column as given.',
+    'Plane irradiation (POA) = beam + diffuse + ground-reflected, using the HDKR transposition model (includes circumsolar and horizon brightening), ground albedo 0.2. It is irradiation reaching the plane: no reflection, temperature, inverter or system losses are applied (this is not electricity).',
+    'Air temperature is modelled: monthly mean + 5 °C × cos(2π × (solar hour - 15) / 24), i.e. a daily swing of ±5 °C peaking at 15:00 solar time; it is not measured.',
+    'Hourly values: kWh/m² in each hour; written in the CSVs as W/m² = round(kWh/m² × 1000) (the mean irradiance during the hour equals Wh/m² in that hour).',
+    'Monthly totals = sum of the unrounded hourly values of the month, rounded to 1 decimal; daily values = monthly total / days in month (2 decimals); peak_ghi_w_m2 = round(max hourly GHI of the month × 1000).',
+    'Annual totals = sum of all 8,760 unrounded hourly values, rounded to whole kWh/m²; peak_sun_hours_per_day = annual plane / 365 (2 decimals); diffuse_fraction = annual DHI / annual GHI (3 decimals); mean temperature = mean of all hours (1 decimal).',
+    'typical_day.csv: for each month and clock hour, sum of that hour over all days of the month / days in month; irradiance rounded to whole W/m², temperature to 1 decimal.',
+    'Optimal tilt: the whole year is recomputed for every tilt 0, 1, …, 90° at the same azimuth; the tilt with the highest annual plane irradiation wins (strictly greater, so ties go to the lower tilt). gain_vs_selected = optimal / selected - 1.',
+    'best_month / worst_month: compared on the rounded monthly plane_kwh_m2.',
+    `Time: every day has 24 hours on the ${C.YEAR} calendar in local clock time (UTC+${site.utcOffset}, +1 h summer time from 29 March to 24 October inclusive). The summer-time switch is applied per whole day: 29 March is entirely summer time and 25 October (the real switch day) is entirely winter time; no hour is skipped or repeated, so every day has exactly 24 rows.`,
+    'Parameters: names are case-insensitive; numbers may be text with a decimal comma; tilt is clamped to 0-90; azimuth is wrapped into -180..180; booleans accept true/1/yes/si/sí (anything else = no); a latitude beyond ±90 or longitude beyond ±180 stops the job with an error.',
+  ];
+
+  const results = [
+    { label: 'Annual GHI (flat ground)', value: a.ghi_kwh_m2, unit: 'kWh/m² per year' },
+    { label: 'Annual irradiation on the panel plane', value: a.plane_kwh_m2, unit: 'kWh/m² per year' },
+    { label: 'Plane vs flat ground', value: f(planeVsGhi, 1), unit: '% (computed from the two annual values)' },
+    { label: 'Annual DHI (diffuse)', value: a.dhi_kwh_m2, unit: 'kWh/m² per year' },
+    { label: 'Annual DNI (direct normal)', value: a.dni_kwh_m2, unit: 'kWh/m² per year' },
+    { label: 'Diffuse fraction', value: a.diffuse_fraction, unit: `fraction (${f(a.diffuse_fraction * 100, 1)} %)` },
+    { label: 'Peak sun hours on the plane', value: a.peak_sun_hours_per_day, unit: 'h/day (yearly average)' },
+    { label: 'Mean air temperature', value: a.mean_temperature_c, unit: '°C' },
+    opt
+      ? { label: 'Optimal tilt for this azimuth', value: `${opt.tilt_deg}° → ${opt.plane_kwh_m2} kWh/m² per year`, unit: `gain_vs_selected ${opt.gain_vs_selected} (${f(opt.gain_vs_selected * 100, 1)} %)` }
+      : { label: 'Optimal tilt', value: 'not computed', unit: 'optimize_tilt = no' },
+    { label: 'Best month (plane)', value: `${summary.best_month}: ${(mon.find((m) => m.month === summary.best_month) || {}).plane_kwh_m2}`, unit: 'kWh/m²' },
+    { label: 'Worst month (plane)', value: `${summary.worst_month}: ${(mon.find((m) => m.month === summary.worst_month) || {}).plane_kwh_m2}`, unit: 'kWh/m²' },
+    { label: 'Highest typical-day hour on the plane', value: `${tdMax.v} (${MONTH_NAMES[tdMax.m - 1]}, ${String(tdMax.h).padStart(2, '0')}:00)`, unit: 'W/m²' },
+    { label: 'Highest typical-day hour GHI', value: `${tdGhiMax.v} (${MONTH_NAMES[tdGhiMax.m - 1]}, ${String(tdGhiMax.h).padStart(2, '0')}:00)`, unit: 'W/m²' },
+    { label: 'Highest single hour on the plane (irradiation_hourly.csv, rounded)', value: xPoa.text, unit: 'W/m²' },
+    { label: 'Highest single hour GHI (irradiation_hourly.csv, rounded)', value: xGhi.text, unit: 'W/m²' },
+    { label: 'Hours with daylight (GHI above 0)', value: sunlit, unit: `hours of ${nHours}` },
+    { label: 'Lowest hourly air temperature (rounded, modelled)', value: xTmin.text, unit: '°C' },
+    { label: 'Highest hourly air temperature (rounded, modelled)', value: xTmax.text, unit: '°C' },
+    { label: `Daily plane irradiation in ${bm.name} (1st / 15th / last day)`, value: `${f(bm.first, 3)} / ${f(bm.mid, 3)} / ${f(bm.last, 3)}`, unit: 'kWh/m² per day (days differ slightly and smoothly; not identical)' },
+    { label: 'Months where the panel plane gets LESS than flat ground', value: lowerMonths.length ? lowerMonths.map((m) => `${m.month} (${m.plane_kwh_m2} vs ${m.ghi_kwh_m2})`).join(', ') : 'none', unit: 'kWh/m² plane vs GHI' },
+    { label: 'Benchmark (embedded PVGIS cities)', value: benchmark, unit: 'kWh/m² per year GHI' },
+    ...mon.map((m, i) => ({ label: `${MONTH_NAMES[i]}: plane / GHI / per day on plane`, value: `${m.plane_kwh_m2} / ${m.ghi_kwh_m2} / ${m.plane_daily_kwh_m2}`, unit: 'kWh/m², kWh/m², kWh/m² per day' })),
+  ];
+
+  const limitations = [
+    `These are long-term average (typical-year) values built from monthly averages, not measurements and not a forecast. Days are smooth "average" days: all days of a month share the same monthly clearness (cloudiness), and the daily total only changes slowly with the sun's path (e.g. ${bm.name}: ${f(bm.first, 3)} kWh/m² on the 1st, ${f(bm.mid, 3)} on the 15th, ${f(bm.last, 3)} on day ${C.DAYS_IN_MONTH[bestIdx]} on the plane). Cloudy and sunny days are not distinguished, so individual hours/dates in irradiation_hourly.csv must not be read as the weather of that date.`,
+    'Ties: because the typical year is smooth, the same rounded value (e.g. the yearly maximum irradiance or the min/max temperature) occurs on many consecutive days at the same hour. Section 6 gives the first and last occurrence and the count; when a user asks "when" an extreme happens, answer with the hour and range of days, not one date.',
+    ...(lowerMonths.length ? [lowerText] : []),
+    'Irradiation is not electricity: the algorithm does not apply panel efficiency, temperature losses, inverter or wiring losses. Shading, horizon and nearby obstacles are ignored.',
+    `Data coverage is Spain and Andorra (incl. Balearic and Canary Islands). This site is ${f(site.nearestKm, 1)} km from the nearest data point${far ? ': MORE than 60 km, so the figures are only indicative (they are borrowed from Spanish points)' : ' (within 60 km, normal accuracy)'}.`,
+    `The modelled annual GHI (${a.ghi_kwh_m2} kWh/m²) differs from the interpolated PVGIS monthly input (${f(pvgisAnnual, 1)} kWh/m²) by ${f(modelVsPvgis, 1)} % because of the daily-to-hourly model and the Kt cap of 0.8.`,
+    `Rounding: the 12 monthly values add up to ${sumMonthsPlane} kWh/m² (plane) and ${sumMonthsGhi} kWh/m² (GHI), while the annual totals (computed from unrounded hours and rounded to integers) are ${a.plane_kwh_m2} and ${a.ghi_kwh_m2}. Summing hourly or typical-day CSV values also gives small rounding differences. Prefer summary.json for totals.`,
+    'Air temperature is a synthetic ±5 °C daily sine wave around the monthly mean; it is present at night too (irradiance is 0 at night, temperature is not).',
+    `Clock-time quirks: the hourly file always has 24 rows per day; summer time is switched per whole day, so all of ${C.YEAR}-03-29 is already summer time (its 02:00 row exists although that clock hour is skipped in reality) and all of ${C.YEAR}-10-25 (the real switch-back day) is already winter time (the repeated 02:00 hour appears only once). Hours around the real switch moments may therefore be shifted by 1 h compared with a real clock. In March and October typical_day.csv mixes winter- and summer-time days.`,
+    canary ? 'This site is in the Canary Islands time zone (UTC+0); the summary.json → timezone text still says Europe/Madrid, but hours are computed in Canary local time.' : 'Locations outside Spain are still computed in Spanish clock time (UTC+1/+2).',
+    'monthly.csv uses month abbreviations (Jan); typical_day.csv uses month numbers (1). summary.json → elapsed_seconds changes from run to run.',
+    `Ground albedo is fixed at 0.2; very steep planes (near 90°) or north-facing planes receive much less direct light${p.tilt >= 60 || Math.abs(p.azimuth) >= 120 ? ' (this run uses such a plane)' : ''}.`,
+    ...(pi.unknown.length ? [`${pi.unknown.length} unknown parameter name(s) in algoCustomData.json were ignored and had no effect on the results.${pi.suspicious ? ` ${pi.suspicious} of them contained markup/script-like characters; it looks like an injection test. Nothing was executed and the name is not reproduced in this file.` : ''}`] : []),
+    ...(corrections.length ? [`Parameter values corrected or replaced by defaults: ${corrections.join('; ')}.`] : []),
+    ...(textBools.length ? [`Yes/no parameters given as text were interpreted (no correction needed): ${textBools.join('; ')}.`] : []),
+    ...(!pi.fileFound || !pi.fileReadable ? ['No usable parameter file: every parameter is the default (Barcelona, 30° south-facing).'] : []),
+    exactEqualsRounded
+      ? `The coordinates were given with at most 2 decimals, so summary.json → site holds the same values as shown here (${lat2}, ${lon2})${onCityPoint ? `; this is exactly the embedded reference point of ${onCityPoint.n} (a city centre, not a specific building)` : ''}.`
+      : 'Exact coordinates are only in summary.json → site; this file and the HTML report round them to 2 decimals (about 1 km).',
+    'Privacy: this algorithm uses no dataset, so there are no supply-point ids (CUPS), people or addresses in any output; the generic privacy sentence at the top of this file does not apply here.',
+    'No benchmark is computed by the algorithm itself; section 6 gives a comparison with the embedded reference cities (from the embedded PVGIS inputs) plus clearly marked general knowledge.',
+  ];
+
+  const hourlyNote = p.hourly_output ? 'irradiation_hourly.csv' : 'irradiation_hourly.csv (not written in this run; use typical_day.csv instead)';
+  const questions = [
+    { question: 'How much sun does my roof / panel plane get per year?', answer: `summary.json → annual.plane_kwh_m2 = ${a.plane_kwh_m2} kWh/m² per year for ${dir}. Flat ground: annual.ghi_kwh_m2 = ${a.ghi_kwh_m2}.` },
+    { question: 'How much electricity would my panels produce?', answer: `Not computed here. Rough estimate: kWp × plane kWh/m² × performance ratio (about 0.75-0.85). E.g. 1 kWp ≈ ${a.plane_kwh_m2} × 0.8 ≈ ${Math.round(a.plane_kwh_m2 * 0.8)} kWh/year. Or panel area (m²) × efficiency × plane kWh/m². Say it is an estimate.` },
+    { question: 'Which month is best / worst?', answer: `summary.json → best_month (${summary.best_month}) and worst_month (${summary.worst_month}); full list in monthly.csv → plane_kwh_m2 (sort descending).` },
+    { question: 'What is the best tilt?', answer: opt ? `summary.json → optimal_tilt.tilt_deg = ${opt.tilt_deg}° (for azimuth ${opt.azimuth_deg}°), giving ${opt.plane_kwh_m2} kWh/m², ${f(opt.gain_vs_selected * 100, 1)} % vs the chosen ${f(p.tilt, 1)}°. The azimuth was not optimised.` : 'Not computed in this run (optimize_tilt = no); the job must be re-run with optimize_tilt = true.' },
+    { question: 'What are the sunniest hours of the day in a given month?', answer: 'typical_day.csv: filter month = N (1-12), sort by plane_w_m2 (or ghi_w_m2) descending. Hours are local clock time.' },
+    { question: 'How much irradiation on a specific date?', answer: `${hourlyNote}: sum plane_w_m2 (or ghi_w_m2) of the 24 rows whose local_datetime starts with that date, divide by 1000 → kWh/m². It is a typical-year value (all days of a month are smooth average days that differ only slightly), not that date's real weather: the data cannot say whether a given date was cloudy.` },
+    { question: 'When is the hottest / coldest hour, or the strongest single hour?', answer: `Section 6 ("Highest/Lowest hourly air temperature", "Highest single hour"). In irradiation_hourly.csv the same rounded extreme repeats on many days at the same clock hour, so give the hour and the range of days (e.g. coldest: ${xTmin.text}). Modelled values, not measured.` },
+    { question: 'Why does the tilted plane get less than flat ground in some months?', answer: lowerMonths.length ? `${lowerText} Monthly values: monthly.csv plane_kwh_m2 vs ghi_kwh_m2.` : 'In this run the plane gets at least as much as flat ground in every month (compare monthly.csv plane_kwh_m2 with ghi_kwh_m2).' },
+    { question: 'Is this a good solar location / a good value?', answer: `${benchmark} Plane gain vs flat ground: ${f(planeVsGhi, 1)} %.` },
+    { question: 'At what time of day is the sun strongest on my panels?', answer: `typical_day.csv: rows with month = N (1-12), highest plane_w_m2. Over the year the highest typical-day value is ${tdMax.v} W/m² in ${MONTH_NAMES[tdMax.m - 1]} at ${String(tdMax.h).padStart(2, '0')}:00-${String(tdMax.h).padStart(2, '0')}:59 local clock time (flat-ground GHI peaks at ${String(tdGhiMax.h).padStart(2, '0')}:00 in ${MONTH_NAMES[tdGhiMax.m - 1]}, ${tdGhiMax.v} W/m²). Clock time includes summer time, so solar noon falls around 13:00-14:00 in summer.` },
+    { question: 'What are peak sun hours?', answer: `summary.json → annual.peak_sun_hours_per_day = ${a.peak_sun_hours_per_day} h/day (plane). Per month: monthly.csv → plane_daily_kwh_m2 (kWh/m²/day = hours at 1000 W/m²).` },
+    { question: 'How much light is direct vs diffuse?', answer: `summary.json → annual.diffuse_fraction = ${a.diffuse_fraction} (diffuse share of GHI); direct horizontal = GHI - DHI = ${a.ghi_kwh_m2 - a.dhi_kwh_m2} kWh/m². Monthly: monthly.csv dhi_kwh_m2 / ghi_kwh_m2.` },
+    { question: 'Is this measured data or a forecast?', answer: 'Neither: a modelled typical year from PVGIS 2011-2020 monthly averages (see section 5).' },
+    { question: 'Why do the monthly values not add up to the annual one?', answer: 'Rounding: monthly values are rounded to 1 decimal, annual totals are summed from unrounded hours and rounded to integers (section 7).' },
+    { question: 'What is the temperature in summer / winter?', answer: 'monthly.csv → mean_temperature_c (monthly mean); typical_day.csv → temperature_c for the daily course. Modelled, not measured.' },
+    { question: 'Where exactly is the site?', answer: `About ${lat2}°, ${lon2}°${city && city.city ? `, nearest embedded city ${city.city.n} (~${f(city.km, 0)} km)` : ''}. Exact coordinates: summary.json → site.latitude / site.longitude.` },
+  ];
+
+  const glossary = [
+    { term: 'Irradiance (W/m²)', meaning: 'Solar power per square metre at a moment (or averaged over an hour).' },
+    { term: 'Irradiation (kWh/m²)', meaning: 'Solar energy per square metre accumulated over a period (hour, month, year).' },
+    { term: 'GHI', meaning: 'Global horizontal irradiance/irradiation: all sunlight on flat ground (direct + diffuse).' },
+    { term: 'DHI', meaning: 'Diffuse horizontal irradiance: light scattered by sky and clouds, arriving from all directions.' },
+    { term: 'DNI', meaning: 'Direct normal irradiance: direct beam on a surface held perpendicular to the sun.' },
+    { term: 'POA / plane', meaning: 'Plane of array: irradiance on the tilted, oriented panel surface (direct + diffuse + ground-reflected).' },
+    { term: 'Tilt', meaning: 'Panel angle from horizontal: 0° flat, 90° vertical (facade).' },
+    { term: 'Azimuth', meaning: 'Panel orientation in this algorithm: 0° south, -90° east, 90° west, ±180° north.' },
+    { term: 'Peak sun hours', meaning: 'Daily irradiation expressed as hours at 1000 W/m² (5 kWh/m²/day = 5 peak sun hours).' },
+    { term: 'Diffuse fraction', meaning: 'Share of GHI that is diffuse; higher means cloudier/hazier.' },
+    { term: 'Optimal tilt', meaning: 'Tilt giving the most annual energy for the chosen orientation.' },
+    { term: 'PVGIS / SARAH-2', meaning: 'EU Joint Research Centre solar database; SARAH-2 is its satellite-derived irradiation dataset.' },
+    { term: 'Clearness index (Kt)', meaning: 'Ratio of irradiation reaching the ground to irradiation at the top of the atmosphere.' },
+    { term: 'Albedo', meaning: 'Fraction of sunlight reflected by the ground (0.2 assumed).' },
+    { term: 'HDKR', meaning: 'Hay-Davies-Klucher-Reindl model used to convert horizontal irradiance to a tilted plane.' },
+    { term: 'Typical year', meaning: 'A synthetic year representing long-term average conditions, not a specific past year.' },
+    { term: 'kWp', meaning: 'Kilowatt-peak: panel power under standard test conditions (1000 W/m², 25 °C); 1 kWp ≈ 5-6 m² of panels.' },
+    { term: 'Performance ratio', meaning: 'Fraction of the theoretical energy actually delivered as AC electricity (typically 0.75-0.85).' },
+    { term: 'Compute-to-Data (C2D)', meaning: 'The algorithm runs inside the data provider\'s infrastructure; only these output files are returned.' },
+  ];
+
+  const facts = {
+    algorithm: summary.algorithm, version: summary.version, generated_at: generatedAt,
+    marketplace: 'Empower-X (Zertipower algorithm)',
+    parameters: {
+      latitude_rounded: Number(lat2), longitude_rounded: Number(lon2), tilt_deg: p.tilt, azimuth_deg: p.azimuth,
+      optimize_tilt: p.optimize_tilt, hourly_output: p.hourly_output, parameter_status: pi.status, unknown_parameters_ignored: pi.unknown.length,
+    },
+    site: { nearest_pvgis_point_km: summary.site.nearest_pvgis_point_km, far_from_data: far, nearest_city: city && city.city ? city.city.n : null, utc_offset_winter: site.utcOffset },
+    period: { calendar_year: C.YEAR, hours: nHours, timezone: summary.timezone },
+    annual: { ...a },
+    optimal_tilt: opt,
+    best_month: summary.best_month, worst_month: summary.worst_month,
+    monthly_plane_kwh_m2: Object.fromEntries(mon.map((m) => [m.month, m.plane_kwh_m2])),
+    monthly_ghi_kwh_m2: Object.fromEntries(mon.map((m) => [m.month, m.ghi_kwh_m2])),
+    max_hour_plane_w_m2: { value: xPoa.value, first_at: xPoa.first, tied_hours: xPoa.count },
+    max_hour_ghi_w_m2: { value: xGhi.value, first_at: xGhi.first, tied_hours: xGhi.count },
+    min_temperature_c: { value: xTmin.value, first_at: xTmin.first, tied_hours: xTmin.count },
+    max_temperature_c: { value: xTmax.value, first_at: xTmax.first, tied_hours: xTmax.count },
+    plane_vs_ghi_pct: r(planeVsGhi, 1),
+    months_plane_below_ghi: lowerMonths.map((m) => m.month),
+    benchmark_cities_annual_ghi_kwh_m2: { min: r(cityLo.v, 0), median: r(cityMed, 0), max: r(cityHi.v, 0), count: cityAnnual.length, site_higher_than: rankBelow },
+    electricity_computed: false,
+    daylight_hours: sunlit,
+    pvgis_interpolated_annual_ghi_kwh_m2: r(pvgisAnnual, 1),
+    output_files: outFiles.concat([CONTEXT_FILE]),
+  };
+
+  return contextDoc({
+    title: 'Solar Irradiation Curve',
+    summary: 'Solar Irradiation Curve (Zertipower, on the Empower-X data-space marketplace) estimates how much solar energy reaches a location over a typical year, both on flat ground and on a panel plane with a chosen tilt and orientation. ' +
+      'It needs no dataset: it uses the coordinates and plane given as job parameters and embedded long-term PVGIS satellite averages for Spain and Andorra. ' +
+      `It outputs annual, monthly, typical-day and hour-by-hour irradiation, air temperature and (optionally) the best tilt. It involves no supply points (CUPS), people or personal data. This run: site about ${lat2}°, ${lon2}°, plane ${dir}.`,
+    run, files, fields, method, results, limitations, questions, glossary, facts,
+  });
+}
+
 function main() {
   const started = Date.now();
   fs.mkdirSync(OUTPUTS, { recursive: true });
@@ -1491,6 +1874,7 @@ function main() {
     fs.writeFileSync(path.join(OUTPUTS, 'irradiation_hourly.csv'), rows.join('\n') + '\n');
   }
   reportWrite(fs, path.join(OUTPUTS, 'solar_irradiation_report.html'), () => renderReport(summary, day, p));
+  contextWrite(fs, path.join(OUTPUTS, CONTEXT_FILE), () => buildContext({ summary, p, site, res, day }));
   log(`Done in ${summary.elapsed_seconds} s: GHI ${summary.annual.ghi_kwh_m2} kWh/m2, plane ${summary.annual.plane_kwh_m2} kWh/m2` +
     (optimal ? `, optimal tilt ${optimal.tilt}°` : ''));
   return 0;

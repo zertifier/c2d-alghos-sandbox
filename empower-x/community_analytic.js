@@ -420,7 +420,7 @@ function contextDoc({ title, summary = '', run = [], files = [], fields = [], me
     out.push('');
     out.push('> This file explains the outputs of one Compute-to-Data job of the Empower-X data space, ' +
         'so that an AI assistant (or a person) can answer questions about them. ' +
-        'All numbers below come from this run. Identifiers of supply points (CUPS) and people are shortened for privacy.');
+        'All numbers below come from this run. Where the data contains identifiers of supply points (CUPS), cars or people, they are shortened here for privacy.');
     out.push('');
     out.push('## 1. What this algorithm does'); out.push(''); out.push(mdText(summary)); out.push('');
     out.push('## 2. This run'); out.push(''); out.push(mdTable([{ key: 'label', label: 'Item' }, { key: 'value', label: 'Value' }], run));
@@ -897,6 +897,383 @@ function renderReport(results, details) {
 }
 
 /* =========================
+   AI CONTEXT (AI_CONTEXT.md: plain-language description of this run's outputs; read-only)
+   ========================= */
+
+// Night hours (clock time of the input timestamps) used to flag surplus exported in the dark.
+const CONTEXT_NIGHT = (hour) => hour >= 22 || hour < 6;
+
+// Per-file input statistics for AI_CONTEXT.md. Re-reads a loaded input the way
+// analyzeCommunities does (same community discovery and skips). Never throws.
+function contextInputInfo(file, data, analysis) {
+    const info = { file, communities: analysis ? analysis.length : 0, format: "", stats: [] };
+    try {
+        info.format = data && Array.isArray(data.cups) && data.id === file && typeof data.name === "string" ? "CSV/TXT (parsed by column position)" : "JSON";
+        let communities = [];
+        if (data && data.data && Array.isArray(data.data)) communities = data.data;
+        else if (Array.isArray(data)) communities = data;
+        else if (data && data.communities && Array.isArray(data.communities)) communities = data.communities;
+        else if (data && (data.id || data.name)) communities = [data];
+        communities.forEach(comm => {
+            if (!comm || (!comm.id && !comm.name)) return;
+            const cups = comm.cups || [];
+            if (cups.length === 0) return;
+            const s = {
+                cups: cups.length, records: 0, noTimestamp: 0, minTs: null, maxTs: null,
+                placeTypes: {}, emptyPoints: 0, recMin: Infinity, recMax: 0, badValues: 0, negative: 0, both: 0,
+                nightExport: 0, nightExportKwh: 0, productionRecords: 0, productionKwh: 0, batteryRecords: 0, dupTs: 0,
+                pointIds: cups.map(c => c && c.id)
+            };
+            cups.forEach(cup => {
+                const arr = (cup && (cup.energy_hourly || cup.energyHourly)) || [];
+                const t = String((cup && (cup.place_type || cup.placeType)) || "unspecified");
+                s.placeTypes[t] = (s.placeTypes[t] || 0) + 1;
+                if (!arr.length) s.emptyPoints++;
+                s.recMin = Math.min(s.recMin, arr.length);
+                s.recMax = Math.max(s.recMax, arr.length);
+                const seen = new Set();
+                arr.forEach(h => {
+                    s.records++;
+                    if (!h) return;
+                    const rawIn = h.kwhIn || h.kwh_in || 0;
+                    const rawOut = h.kwhOut || h.kwh_out || 0;
+                    const vIn = parseFloat(rawIn) || 0;
+                    const vOut = parseFloat(rawOut) || 0;
+                    if (Number.isNaN(parseFloat(rawIn)) || Number.isNaN(parseFloat(rawOut))) s.badValues++;
+                    if (vIn < 0 || vOut < 0) s.negative++;
+                    if (vIn > 0 && vOut > 0) s.both++;
+                    const prod = parseFloat(h.production);
+                    if (prod > 0) { s.productionRecords++; s.productionKwh += prod; }
+                    if (parseFloat(h.battery) > 0) s.batteryRecords++;
+                    const ts = String(h.info_dt || h.infoDt || "");
+                    if (!ts) { s.noTimestamp++; return; }
+                    if (seen.has(ts)) s.dupTs++;
+                    seen.add(ts);
+                    if (s.minTs === null || ts < s.minTs) s.minTs = ts;
+                    if (s.maxTs === null || ts > s.maxTs) s.maxTs = ts;
+                    const m = /^\d{4}-\d{2}-\d{2}[ T](\d{2})/.exec(ts);
+                    if (m && vOut > 0 && CONTEXT_NIGHT(Number(m[1]))) { s.nightExport++; s.nightExportKwh += vOut; }
+                });
+            });
+            if (s.recMin === Infinity) s.recMin = 0;
+            info.stats.push(s);
+        });
+    } catch (e) {
+        info.stats = [];
+        info.statsError = String(e && e.message ? e.message : e).slice(0, 200);
+    }
+    return info;
+}
+
+function buildContext(results, details, inputs) {
+    const r4 = (v) => (v !== null && v !== undefined && Number.isFinite(Number(v)) ? Number(Number(v).toFixed(4)) : null);
+    const r1 = (v) => (v !== null && v !== undefined && Number.isFinite(Number(v)) ? Number(Number(v).toFixed(1)) : null);
+    const pct = (part, whole) => (whole > 0 ? (part / whole) * 100 : null);
+    const nameOf = (r, i) => String(r.community_name || r.community_id || `Community ${i + 1}`);
+    const sum = (arr, f) => arr.reduce((a, x) => a + f(x), 0);
+    const generatedAt = new Date().toISOString(); // one value for section 2 and the facts block
+    const POINT_ROWS = 30; // per-community cap for the per-point list in section 6
+
+    // Files in the input folder that the file filter did not consider.
+    let ignored = [];
+    try {
+        ignored = fs.readdirSync(INPUT_DIR).filter(f => !inputs.some(x => x.file === f));
+    } catch (e) { /* keep empty */ }
+
+    const stats = inputs.flatMap(x => x.stats || []);
+    const statsAligned = stats.length === results.length;
+    const aggs = results.map((_, i) => (details[i] && details[i].byTs && details[i].byTs.size ? reportTimeAggregates(details[i].byTs) : null));
+
+    const totalIn = sum(results, r => Number(r.metrics.total_community_consumption) || 0);
+    const totalOut = sum(results, r => Number(r.metrics.total_community_surplus) || 0);
+    const totalCups = sum(results, r => Number(r.metrics.total_cups) || 0);
+    const totalRecords = sum(stats, s => s.records);
+    const minTs = stats.map(s => s.minTs).filter(Boolean).sort()[0] || null;
+    const maxTs = stats.map(s => s.maxTs).filter(Boolean).sort().slice(-1)[0] || null;
+    const allDays = [...new Set(aggs.filter(Boolean).flatMap(a => a.days))].sort();
+
+    // CUPS listed in more than one community.
+    const idCount = new Map();
+    stats.forEach(s => new Set(s.pointIds).forEach(id => idCount.set(id, (idCount.get(id) || 0) + 1)));
+    const sharedIds = [...idCount.values()].filter(n => n > 1).length;
+
+    // Per-community derived figures (same formulas and P-numbering as the HTML report).
+    const comm = results.map((r, i) => {
+        const inT = Number(r.metrics.total_community_consumption) || 0;
+        const outT = Number(r.metrics.total_community_surplus) || 0;
+        const agg = aggs[i];
+        const det = details[i];
+        const pointNo = new Map();
+        if (det) det.cups.forEach((c, k) => { if (!pointNo.has(c.id)) pointNo.set(c.id, `P${k + 1}`); });
+        const label = (id) => (pointNo.has(id) ? `${pointNo.get(id)} ` : "") + reportMaskId(id);
+        const maskCount = new Map();
+        if (det) det.cups.forEach(c => { const k = reportMaskId(c.id); maskCount.set(k, (maskCount.get(k) || 0) + 1); });
+        const dupMasks = [...maskCount.entries()].filter(([, n]) => n > 1).map(([k, n]) => `${k} (${n} points: ${det.cups.map((c, j) => (reportMaskId(c.id) === k ? `P${j + 1}` : null)).filter(Boolean).join(", ")})`);
+        let exportHours = 0;
+        if (det && det.byTs) for (const v of det.byTs.values()) if (v.out > v.in) exportHours++;
+        return {
+            r, i, inT, outT, agg, det, label, exportHours, dupMasks,
+            ratio: pct(outT, inT),
+            potential: pct(Math.min(outT, inT), inT),
+            hourly: agg ? pct(agg.matched, inT) : null,
+            st: statsAligned ? stats[i] : null
+        };
+    });
+
+    // ---------- 2. this run ----------
+    const run = [];
+    run.push({ label: "Generated at (UTC)", value: `${generatedAt} (this file; the HTML footer shows its own generation time to the minute)` });
+    run.push({ label: "Algorithm", value: "community_analytic.js (Empower-X C2D algorithm); no version number is recorded in the algorithm." });
+    run.push({ label: "Input files considered", value: inputs.length ? inputs.map(x => x.file).join(", ") : "none" });
+    inputs.forEach(x => {
+        let v;
+        if (x.error) v = `FAILED, skipped: ${x.error}`;
+        else if (!x.communities) v = `read as ${x.format || "JSON"}; contained no energy community with an id/name and at least one supply point, so it contributed nothing` +
+            (x.file === "algoCustomData.json" ? " (this is the job's parameter file; the algorithm reads every .json file as possible data)" : "");
+        else v = `read as ${x.format || "JSON"}; ${x.communities} communit${x.communities === 1 ? "y" : "ies"}, ` +
+            `${sum(x.stats || [], s => s.cups)} supply points, ${sum(x.stats || [], s => s.records)} hourly records`;
+        run.push({ label: `Input file ${x.file}`, value: v });
+    });
+    run.push({ label: "Files in the input folder not considered", value: ignored.length ? `${ignored.length}: ${ignored.slice(0, 20).join(", ")} (only .json, .csv, .txt and extension-less files not starting with '.' are read)` : "none" });
+    run.push({ label: "Communities analysed", value: results.length });
+    run.push({ label: "Supply points (CUPS) analysed", value: totalCups });
+    run.push({ label: "Hourly records read", value: totalRecords });
+    run.push({ label: "Time period covered", value: minTs ? `${minTs} to ${maxTs} (timestamps as written in the input, no time zone given)` : "unknown (no timestamps)" });
+    run.push({ label: "Days with data", value: allDays.length });
+    run.push({ label: "Parameters (algoCustomData)", value: "None: this algorithm has no configurable parameters, any values in algoCustomData.json are ignored. Fixed settings: outlier percentiles 5% and 95%; JSON numbers rounded to 4 decimals." });
+
+    // ---------- 3. output files ----------
+    const files = [{ file: "community_analysis.json", format: "JSON (array)", contents: `The result: one object per energy community (${results.length} in this run) with totals, averages, largest consumer and surplus producer, and top/bottom 5% consumers. Holds the FULL supply-point (CUPS) ids.` }];
+    let htmlExists = false;
+    try { htmlExists = fs.existsSync(path.join(OUTPUT_DIR, "community_analysis.html")); } catch (e) { /* ignore */ }
+    if (htmlExists) files.push({ file: "community_analysis.html", format: "HTML (self-contained, open in a browser)", contents: "Visual report: overview KPIs and charts for all communities, then one section per community (KPIs, self-sufficiency donut, per-supply-point bar chart, top/bottom 5% chart, average 24-hour profile). Supply-point ids are MASKED (first 4 and last 4 characters) and numbered P1, P2 ... in input order. Rounding: the KPI tiles show kWh and % with at most 1 decimal; the 'Communities at a glance' table, chart tooltips (hover) and bar labels show up to 2 decimals; percentages always 1 decimal. Thousands separators are commas (28,987.97). No timestamps of individual records, no place types and no full ids are shown." });
+
+    // ---------- 4. fields ----------
+    const J = "community_analysis.json";
+    const H = "community_analysis.html";
+    const fields = [
+        { file: J, field: "(root)", type: "array of objects", unit: "", meaning: "One element per energy community, in input order (files in directory listing order, communities in the order they appear in each file). Empty array [] if no community was found." },
+        { file: J, field: "[].community_id", type: "string (as in input)", unit: "", meaning: "Community id from the input (key absent if the input community had only a name)." },
+        { file: J, field: "[].community_name", type: "string (as in input)", unit: "", meaning: "Community name from the input (key absent if the input had none)." },
+        { file: J, field: "[].metrics.total_cups", type: "integer", unit: "count", meaning: "Number of supply points (CUPS) listed in the community, including any without hourly data (they count as 0 kWh)." },
+        { file: J, field: "[].metrics.avg_consumption_per_cup", type: "number (4 decimals)", unit: "kWh", meaning: "Total grid consumption of the community / total_cups, over the whole period (not per day)." },
+        { file: J, field: "[].metrics.avg_surplus_per_cup", type: "number (4 decimals)", unit: "kWh", meaning: "Total surplus exported by the community / total_cups, over the whole period." },
+        { file: J, field: "[].metrics.total_community_consumption", type: "number (4 decimals)", unit: "kWh", meaning: "Sum of kwh_in (energy taken from the grid) over all supply points and all hours." },
+        { file: J, field: "[].metrics.total_community_surplus", type: "number (4 decimals)", unit: "kWh", meaning: "Sum of kwh_out (energy fed back to the grid, e.g. excess solar) over all supply points and all hours." },
+        { file: J, field: "[].highlights.max_consumer.cups_id", type: "string", unit: "", meaning: "Full CUPS id of the supply point with the highest total consumption (ties: the last one in input order)." },
+        { file: J, field: "[].highlights.max_consumer.value", type: "number (4 decimals)", unit: "kWh", meaning: "That supply point's total grid consumption over the period." },
+        { file: J, field: "[].highlights.max_surplus.cups_id", type: "string", unit: "", meaning: "Full CUPS id of the supply point with the highest total surplus exported. If no point exported anything this is simply the last point in input order, with value 0." },
+        { file: J, field: "[].highlights.max_surplus.value", type: "number (4 decimals)", unit: "kWh", meaning: "That supply point's total surplus exported over the period." },
+        { file: J, field: "[].outliers.bottom_5_percent_consumers", type: "array of {cups_id, value}", unit: "", meaning: "Supply points whose total consumption is at or below the 5th percentile within the community; in input order (not sorted)." },
+        { file: J, field: "[].outliers.top_5_percent_consumers", type: "array of {cups_id, value}", unit: "", meaning: "Supply points whose total consumption is at or above the 95th percentile within the community; in input order (not sorted)." },
+        { file: J, field: "[].outliers.*[].cups_id", type: "string", unit: "", meaning: "Full CUPS id." },
+        { file: J, field: "[].outliers.*[].value", type: "number (4 decimals)", unit: "kWh", meaning: "That supply point's total grid consumption over the period." }
+    ];
+    if (htmlExists) fields.push(
+        { file: H, field: "Overview KPI tiles", type: "text (1 decimal)", unit: "count, kWh, %", meaning: "Communities, Supply points, Total grid consumption, Total surplus exported, 'Surplus vs consumption' % (= total surplus / total consumption x 100, all communities together)." },
+        { file: H, field: "Overview table 'Communities at a glance'", type: "table (up to 2 decimals)", unit: "count, kWh, %", meaning: "One row per community: Community, Supply points, Consumption (kWh) = metrics.total_community_consumption, Surplus (kWh) = metrics.total_community_surplus, Avg. per point (kWh) = metrics.avg_consumption_per_cup, Surplus vs consumption (%) = surplus / consumption x 100 (1 decimal)." },
+        { file: H, field: "Per-community KPI tiles", type: "text (1 decimal)", unit: "kWh, %", meaning: "Same metrics as the JSON (rounded), the largest consumer and largest surplus producer with P-number + masked id and their share of the community total, and 'Self-sufficiency potential' % (not in the JSON)." },
+        { file: H, field: "Self-sufficiency donut + note", type: "inline SVG + sentence", unit: "kWh, %", meaning: "Slices 'Coverable by shared surplus' = min(surplus, consumption) and 'Still needed from the grid'. The note under it gives the potential %; the hour-matched coverage appears there as a NUMBER only when it differs from the potential, otherwise the note just says 'In no hour does the community feed back more than it consumes...'." },
+        { file: H, field: "Charts", type: "inline SVG", unit: "kWh, kWh/day, kWh per hour", meaning: "Grid consumption and surplus per community (bars); daily consumption per community (line, kWh/day); per-supply-point bars (every point, labelled P-number + masked id, values in tooltips with up to 2 decimals); top/bottom 5% bars (sorted by value); average 24-hour profile (community total per clock hour, averaged over the days, kWh per hour)." },
+        { file: H, field: "Footer", type: "text", unit: "", meaning: "Generation time (UTC, to the minute) and a pointer to community_analysis.json." }
+    );
+
+    // ---------- 5. method ----------
+    const method = [
+        "Input: energy communities, each with a list of supply points (cups), each with hourly records (energy_hourly or energyHourly) carrying kwh_in (or kwhIn) and kwh_out (or kwhOut). Communities are taken from data[], communities[], a top-level array, or a single community object. Communities without id and name, or with no supply points, are skipped.",
+        "CSV/TXT inputs (only when a file is not valid JSON): comma-separated; CUPS id in column 4, timestamp in column 6, kwh_in in column 7, kwh_out in column 8 (1-based); lines with fewer than 7 columns and header lines are skipped; the whole file becomes one community named after the file.",
+        "Field precedence: for each hourly record the algorithm takes kwhIn if it is present and truthy, otherwise kwh_in (same for kwhOut / kwh_out); energyHourly is used only if energy_hourly is missing, infoDt only if info_dt is missing. Because the test is 'truthy', an explicit 0 or empty kwhIn falls through to kwh_in.",
+        "Values are read with parseFloat; missing, empty or non-numeric values count as 0. Other input fields (production, battery, place_type, record ids) are NOT used for the JSON result.",
+        "Per supply point: total consumption = sum of kwh_in over all its hourly records; total surplus = sum of kwh_out.",
+        "Per community: total_community_consumption = sum of the point totals; total_community_surplus likewise; avg_consumption_per_cup = total consumption / total_cups; avg_surplus_per_cup = total surplus / total_cups.",
+        "Largest consumer / surplus producer = point with the maximum total (stable ascending sort, last element taken).",
+        "Outliers: percentiles of the points' consumption totals with linear interpolation at position (n - 1) x p, p = 0.05 and 0.95. bottom_5 = points with total <= P5; top_5 = points with total >= P95. With fewer than about 20 points this is just the single smallest and the single largest consumer (plus ties).",
+        "Rounding: every number in the JSON is rounded to 4 decimals at the end (averages come from unrounded totals; trailing zeros are dropped, so 16084.63 means 16084.6300). The HTML KPI tiles show 1 decimal; the HTML table, tooltips and bar labels show up to 2 decimals; all percentages in the HTML and in this file are rounded to 1 decimal. Per-point values in section 6 of this file are rounded to 4 decimals.",
+        "Time: timestamps (info_dt) are used as written, without time-zone conversion. They matter only for the HTML charts (daily totals use the YYYY-MM-DD part, the hourly profile the HH part). The JSON totals ignore time and sum whatever records are present.",
+        "Surplus vs consumption (%) (HTML overview tile and table) = total surplus / total consumption x 100. It can exceed 100.",
+        "Self-sufficiency potential (%) (HTML per-community KPI and donut) = min(total surplus, total consumption) / total consumption x 100: the share of grid consumption the community's own exported surplus could cover if shared. It equals 'Surplus vs consumption' whenever surplus <= consumption and is capped at 100 when surplus exceeds consumption.",
+        "Hour-matched coverage (%) = sum over timestamps of min(community consumption, community surplus in that hour) / total consumption x 100, i.e. surplus that could be used in the same hour it was exported. It is computed for this file; the HTML shows it as a number only when it differs from the potential (otherwise the HTML only says that in no hour the community fed back more than it consumed). It is never higher than the potential.",
+        "Shares: largest consumer share = its value / community consumption x 100; largest producer share = its value / community surplus x 100.",
+        "Several input files are processed independently and their communities appended; a community present in two files is reported twice."
+    ];
+
+    // ---------- 6. results ----------
+    const results6 = [
+        { label: "Communities analysed", value: results.length, unit: "count" },
+        { label: "Supply points", value: totalCups, unit: "count" },
+        { label: "Total grid consumption (all communities)", value: r4(totalIn), unit: "kWh" },
+        { label: "Total surplus exported (all communities)", value: r4(totalOut), unit: "kWh" },
+        { label: "Surplus vs consumption (all communities)", value: r1(pct(totalOut, totalIn)), unit: "%" }
+    ];
+    comm.forEach(c => {
+        const m = c.r.metrics;
+        const n = nameOf(c.r, c.i);
+        const mc = (c.r.highlights && c.r.highlights.max_consumer) || {};
+        const ms = (c.r.highlights && c.r.highlights.max_surplus) || {};
+        results6.push(
+            { label: `${n}: supply points`, value: m.total_cups, unit: "count" },
+            { label: `${n}: grid consumption`, value: m.total_community_consumption, unit: "kWh" },
+            { label: `${n}: surplus exported`, value: m.total_community_surplus, unit: "kWh" },
+            { label: `${n}: average consumption per point`, value: m.avg_consumption_per_cup, unit: "kWh" },
+            { label: `${n}: average surplus per point`, value: m.avg_surplus_per_cup, unit: "kWh" },
+            { label: `${n}: largest consumer`, value: `${c.label(mc.cups_id)} = ${mc.value} (${r1(pct(Number(mc.value) || 0, c.inT))}% of community consumption)`, unit: "kWh" },
+            { label: `${n}: largest surplus producer`, value: Number(ms.value) > 0 ? `${c.label(ms.cups_id)} = ${ms.value} (${r1(pct(Number(ms.value) || 0, c.outT))}% of community surplus)` : "none (no point exported surplus)", unit: "kWh" },
+            { label: `${n}: top 5% consumers`, value: ((c.r.outliers || {}).top_5_percent_consumers || []).map(o => `${c.label(o.cups_id)} = ${o.value}`).join("; ") || "none", unit: "kWh" },
+            { label: `${n}: bottom 5% consumers`, value: ((c.r.outliers || {}).bottom_5_percent_consumers || []).map(o => `${c.label(o.cups_id)} = ${o.value}`).join("; ") || "none", unit: "kWh" },
+            { label: `${n}: surplus vs consumption (HTML table)`, value: r1(c.ratio), unit: "%" },
+            { label: `${n}: self-sufficiency potential (HTML KPI and donut)`, value: r1(c.potential), unit: "%" },
+            { label: `${n}: hour-matched coverage (computed for this file; ${c.hourly !== null && c.potential !== null && Math.abs(c.hourly - c.potential) > 0.05 ? "also shown as a number in the HTML donut note, because it differs from the potential" : "NOT shown as a number in the HTML, because it equals the potential"})`, value: r1(c.hourly), unit: "%" }
+        );
+    });
+    // Per supply point (masked), largest consumers first; not in the JSON. 4 decimals (more precise than the HTML).
+    // place type is an input label, not in any output file.
+    comm.forEach(c => {
+        if (!c.det) return;
+        c.det.cups.slice().sort((a, b) => b.in - a.in).slice(0, POINT_ROWS).forEach((p, rank) => results6.push({
+            label: `${nameOf(c.r, c.i)}: point ${c.label(p.id)}${p.type ? ` [input place_type: ${p.type}]` : ""}`,
+            value: `rank ${rank + 1} by consumption; consumption ${r4(p.in)}, surplus ${r4(p.out)} (${r1(pct(p.in, c.inT))}% of community consumption${c.outT > 0 ? `, ${r1(pct(p.out, c.outT))}% of community surplus` : ""})`,
+            unit: "kWh"
+        }));
+        if (c.det.cups.length > POINT_ROWS) results6.push({ label: `${nameOf(c.r, c.i)}: other points`, value: `${c.det.cups.length - POINT_ROWS} more, see the HTML bar chart (2 decimals)`, unit: "" });
+        if (c.dupMasks.length) results6.push({ label: `${nameOf(c.r, c.i)}: masked ids shared by several points`, value: `${c.dupMasks.join("; ")}. Always use the P-number to tell them apart.`, unit: "" });
+    });
+
+    // ---------- 7. limitations ----------
+    const lim = [
+        "Consumption here means energy IMPORTED FROM THE GRID (kwh_in) and surplus means energy EXPORTED TO THE GRID (kwh_out). Solar energy used on site (self-consumption) is in neither figure, so real total consumption and real production are higher than shown.",
+        "The JSON has no complete per-supply-point list: only the largest consumer, the largest surplus producer and the top/bottom 5% points appear there, with full CUPS ids. Which source to trust for a per-point value: the JSON where the point appears there (4 decimals, authoritative); otherwise the per-point list in section 6 of this file (4 decimals, same calculation); the HTML bar chart shows the same values rounded to 2 decimals.",
+        "Supply-point ids are masked in the HTML and in this file (first 4 + last 4 characters, prefixed by the P-number = position in the community's input list). Masked ids are NOT unique, even inside one community (see 'masked ids shared by several points' in section 6), so always quote the P-number together with the masked id (e.g. 'P5 ES00…AB0F'). P-numbers restart in each community. The full ids are in community_analysis.json, only for the points listed there; to find the full id of a highlighted point, match its kWh value.",
+        "Figures taken from the INPUT data rather than from the outputs, and therefore not visible in or checkable against the HTML or JSON: the place_type labels (section 6 per-point list and section 7), hourly record counts, the period timestamps, the 'production' totals, night-export and battery counts below. The hour-matched coverage and the per-point shares of surplus are computed here from the same data the HTML used.",
+        "No time-zone information: timestamps are used as written (presumably local time). Gaps or missing hours are neither detected nor filled; totals cover the records present.",
+        "Missing or non-numeric kWh values silently count as 0.",
+        "The 5%/95% 'outliers' are relative positions, not anomalies; with few points they are just the smallest and largest consumers.",
+        "Self-sufficiency potential assumes all exported surplus could be shared with members at any time; hour-matched coverage is the stricter estimate without storage. Neither accounts for network losses or legal sharing rules.",
+        "No costs, prices, tariffs or CO2 figures are computed."
+    ];
+    if (inputs.some(x => x.error)) lim.push(`Input files that failed and were skipped: ${inputs.filter(x => x.error).map(x => x.file).join(", ")}.`);
+    if (!results.length) lim.push("No energy community was found in this run, so the JSON is an empty array and there are no results.");
+    if (sharedIds) lim.push(`${sharedIds} supply-point id(s) appear in more than one community; they are counted in each.`);
+    if (!statsAligned && results.length) lim.push("Per-community input statistics could not be matched to the results; the input-quality notes below may be incomplete.");
+    comm.forEach(c => {
+        const s = c.st;
+        if (!s) return;
+        const bits = [];
+        bits.push(`${s.records} hourly records over ${s.cups} points (${s.recMin === s.recMax ? `${s.recMin} per point` : `${s.recMin} to ${s.recMax} per point: uneven coverage, so point totals cover different periods`})`);
+        bits.push(`period ${s.minTs || "?"} to ${s.maxTs || "?"}`);
+        bits.push(`place types: ${Object.entries(s.placeTypes).map(([k, v]) => `${k} ${v}`).join(", ")}`);
+        if (s.emptyPoints) bits.push(`${s.emptyPoints} point(s) without any hourly data (count as 0 but still lower the averages)`);
+        if (s.noTimestamp) bits.push(`${s.noTimestamp} record(s) without timestamp (in the totals, not in the time charts)`);
+        if (s.dupTs) bits.push(`${s.dupTs} duplicate timestamp(s) within a point (all summed)`);
+        if (s.badValues) bits.push(`${s.badValues} record(s) with non-numeric kWh values (counted as 0)`);
+        if (s.negative) bits.push(`${s.negative} record(s) with negative kWh values (summed as they are)`);
+        if (s.both) bits.push(`${s.both} record(s) where a point both imported and exported in the same hour`);
+        if (s.nightExport) bits.push(`${s.nightExport} record(s) with surplus exported at night (22:00-05:59), ${r4(s.nightExportKwh)} kWh: unusual for solar, check the data or the time zone`);
+        if (s.productionRecords) bits.push(`the input also has a 'production' field (above 0 in ${s.productionRecords} records, ${r4(s.productionKwh)} kWh in total) which this algorithm ignores; it is not the same as surplus`);
+        if (s.batteryRecords) bits.push(`'battery' field above 0 in ${s.batteryRecords} records (ignored)`);
+        if (c.exportHours) bits.push(`in ${c.exportHours} hour(s) the community as a whole exported more than it imported`);
+        else if (c.outT > 0) bits.push("in no hour did the community as a whole export more than it imported, so all surplus could in principle be used by other members in the same hour");
+        lim.push(`${nameOf(c.r, c.i)}: ${bits.join("; ")}.`);
+    });
+
+    // ---------- 8. questions ----------
+    const questions = [
+        { question: "How much electricity did a community use / feed back?", answer: "community_analysis.json, element with that community_name: metrics.total_community_consumption (grid import, kWh) and metrics.total_community_surplus (export, kWh). Section 6 lists them for this run." },
+        { question: "Which supply point consumed the most?", answer: "highlights.max_consumer of that community (full CUPS id + kWh). For a ranking of all points use the HTML chart 'Consumption and surplus per supply point' or the masked list in section 6; the JSON has no full per-point list." },
+        { question: "Which supply point exports the most surplus?", answer: "highlights.max_surplus (kWh exported). If its value is 0, no point exported anything." },
+        { question: "Which community consumes the most?", answer: "Sort the JSON array by metrics.total_community_consumption, descending. Use avg_consumption_per_cup to compare communities of different size." },
+        { question: "How self-sufficient could the community be?", answer: "Self-sufficiency potential = min(total_community_surplus, total_community_consumption) / total_community_consumption x 100 (HTML donut, section 6). For a same-hour estimate use the hour-matched coverage in section 6." },
+        { question: "Which points are unusually high or low consumers?", answer: "outliers.top_5_percent_consumers and outliers.bottom_5_percent_consumers (input order; sort by value). In small communities these are simply the largest and smallest consumer." },
+        { question: "What share of the community's consumption is the largest consumer?", answer: "highlights.max_consumer.value / metrics.total_community_consumption x 100 (also in section 6 and the HTML KPI hint)." },
+        { question: "What period does the data cover? When in the day is consumption highest?", answer: "Period: section 2. Daily totals and the average 24-hour profile exist only as HTML charts; the JSON has no time series." },
+        { question: "Why does the HTML show a slightly different number than the JSON?", answer: "Rounding only: the HTML KPI tiles show 1 decimal, the HTML table and chart tooltips up to 2 decimals, with comma thousands separators; the JSON keeps 4 decimals. The JSON is authoritative." },
+        { question: "How much did all communities together use / feed back?", answer: "Add metrics.total_community_consumption (and metrics.total_community_surplus) over all JSON elements; section 6 has the totals and the HTML overview KPIs show them rounded to 1 decimal." },
+        { question: "Which supply point consumes the most in a community and what share is that?", answer: "highlights.max_consumer of that community (full id in the JSON); share = value / metrics.total_community_consumption x 100. Section 6 gives the P-number, masked id and share; rank all points with the section 6 per-point list (sorted by consumption)." },
+        { question: "Is the community's self-sufficiency good?", answer: "Use the self-sufficiency potential and hour-matched coverage in section 6. Values of a few percent mean the shared surplus covers only a small part of grid consumption. It ignores solar used on site (invisible here), so the buildings' real self-sufficiency is higher; there is no benchmark in the outputs." },
+        { question: "Why is the surplus so much smaller than the solar 'production' mentioned in section 7?", answer: "Surplus is only what is exported to the grid (kwh_out). Most production is used on site (self-consumption) and appears in neither consumption nor surplus. The production totals come from the input and are not in any output file." },
+        { question: "How were the top 5% and bottom 5% consumers chosen?", answer: "P5 and P95 of the points' total consumption, linear interpolation at position (n - 1) x p; points at or below P5 / at or above P95 are listed. With fewer than about 20 points this is just the smallest and the largest consumer (plus ties)." },
+        { question: "How much money or CO2 was saved?", answer: "The data does not tell: no prices, tariffs, costs or emission factors are used, and self-consumed solar is not visible." },
+        { question: "Two points have the same masked id: which is which?", answer: "Use the P-number (position in the community's input list), shown in the HTML and in this file. P-numbers restart in each community." },
+        { question: "How much solar did a building produce?", answer: "Not available: the algorithm uses only grid import/export. Surplus (kwh_out) is just the part of production not used on site." },
+        { question: "What is the full id of point P3?", answer: "The HTML and this file show masked ids only. Full CUPS ids are in the JSON only for the max consumer, the max surplus producer and the 5% lists: find the point's kWh value (section 6) and look for the same value in the JSON. Points not listed there have no full id in the outputs." },
+        { question: "What does 'average consumption per point' mean? Is that per day?", answer: `No. metrics.avg_consumption_per_cup = total grid consumption of the community over the whole period / number of supply points. For a daily figure divide by the number of days with data (${allDays.length} in this run).` }
+    ];
+
+    // ---------- 9. glossary ----------
+    const glossary = [
+        { term: "CUPS", meaning: "Codigo Universal del Punto de Suministro: the unique Spanish id of an electricity supply point (meter), e.g. ES0031...0F. Treated as personal data and masked here." },
+        { term: "Supply point (cup, point)", meaning: "One metered grid connection (a building, a street-lighting circuit, ...)." },
+        { term: "Energy community", meaning: "Group of supply points that can share locally produced energy (here e.g. municipal buildings)." },
+        { term: "kWh", meaning: "Kilowatt-hour, the unit of electrical energy used throughout." },
+        { term: "kwh_in / grid consumption", meaning: "Energy imported from the grid by a supply point in one hour." },
+        { term: "kwh_out / surplus", meaning: "Energy exported (fed back) to the grid in one hour, usually excess solar not used on site." },
+        { term: "Self-consumption", meaning: "Locally produced energy used on site; NOT visible in this data (it lowers kwh_in and never appears in kwh_out)." },
+        { term: "Self-sufficiency potential", meaning: "Share of the community's grid consumption its own exported surplus could cover if shared (HTML)." },
+        { term: "Hour-matched coverage", meaning: "Same idea, counting only surplus used in the same hour it is exported." },
+        { term: "Percentile (P5 / P95)", meaning: "Value below which 5% / 95% of the points' consumption totals lie (linear interpolation)." },
+        { term: "place_type", meaning: "Input label of the kind of site (education, office, sports, ...); shown in this file for context only, not in the HTML or JSON." },
+        { term: "Surplus vs consumption", meaning: "Total surplus / total consumption x 100 (can exceed 100)." },
+        { term: "P1, P2 ...", meaning: "Position of a supply point in its community's input list; used with masked ids to tell points apart." },
+        { term: "C2D (Compute-to-Data)", meaning: "The algorithm ran next to the data; only these output files leave the data provider." }
+    ];
+
+    // ---------- 10. facts ----------
+    const facts = {
+        algorithm: "community_analytic.js",
+        title: REPORT_TITLE,
+        generated_at: generatedAt,
+        parameters: { configurable: false, percentile_low: 0.05, percentile_high: 0.95, json_decimals: 4 },
+        inputs: inputs.map(x => ({ file: x.file, ok: !x.error, communities: x.communities || 0, hourly_records: sum(x.stats || [], s => s.records) })),
+        ignored_input_files: ignored.length,
+        period: { from: minTs, to: maxTs, days: allDays.length },
+        communities: results.length,
+        supply_points: totalCups,
+        hourly_records: totalRecords,
+        total_consumption_kwh: r4(totalIn),
+        total_surplus_kwh: r4(totalOut),
+        surplus_vs_consumption_pct: r1(pct(totalOut, totalIn)),
+        per_community: comm.map(c => {
+            const h = c.r.highlights || {};
+            const o = c.r.outliers || {};
+            return {
+                community_id: c.r.community_id === undefined ? null : c.r.community_id,
+                community_name: c.r.community_name === undefined ? null : c.r.community_name,
+                supply_points: c.r.metrics.total_cups,
+                consumption_kwh: c.r.metrics.total_community_consumption,
+                surplus_kwh: c.r.metrics.total_community_surplus,
+                avg_consumption_per_point_kwh: c.r.metrics.avg_consumption_per_cup,
+                avg_surplus_per_point_kwh: c.r.metrics.avg_surplus_per_cup,
+                max_consumer: { point_masked: c.label((h.max_consumer || {}).cups_id), kwh: (h.max_consumer || {}).value },
+                max_surplus: { point_masked: c.label((h.max_surplus || {}).cups_id), kwh: (h.max_surplus || {}).value },
+                top_5_percent_count: (o.top_5_percent_consumers || []).length,
+                bottom_5_percent_count: (o.bottom_5_percent_consumers || []).length,
+                surplus_vs_consumption_pct: r1(c.ratio),
+                self_sufficiency_potential_pct: r1(c.potential),
+                hour_matched_coverage_pct: r1(c.hourly),
+                hours_net_export: c.exportHours,
+                duplicated_masked_ids: c.dupMasks.length
+            };
+        })
+    };
+
+    return contextDoc({
+        title: REPORT_TITLE,
+        summary: "Energy Community Analytics (Empower-X data space) summarises hourly smart-meter data of one or more energy communities. " +
+            "For each community it totals how much electricity its supply points took from the grid and how much surplus (typically solar) they fed back, " +
+            "computes averages per supply point, and names the largest consumer, the largest surplus producer and the top/bottom 5% consumers. " +
+            "An HTML report adds charts and an estimate of how much of the community's needs its own surplus could cover.",
+        run,
+        files,
+        fields,
+        method,
+        results: results6,
+        limitations: lim,
+        questions,
+        glossary,
+        facts
+    });
+}
+
+/* =========================
    MAIN EXECUTION
    ========================= */
 
@@ -910,6 +1287,7 @@ try {
 
     let allCommunityResults = [];
     let reportDetails = []; // chart-only extras, aligned with allCommunityResults (never written to JSON)
+    const contextInputs = []; // per-input-file notes for AI_CONTEXT.md only
 
     files.forEach(file => {
         console.log(`Processing file: ${file}`);
@@ -918,8 +1296,10 @@ try {
             const analysis = analyzeCommunities(data);
             allCommunityResults = allCommunityResults.concat(analysis);
             reportDetails = reportDetails.concat(reportCollectSafe(data, analysis.length));
+            contextInputs.push(contextInputInfo(file, data, analysis));
         } catch (err) {
             console.error(`  -> Failed to process ${file}: ${err.message}`);
+            contextInputs.push({ file, error: String(err && err.message ? err.message : err).slice(0, 200), communities: 0, stats: [] });
         }
     });
 
@@ -932,6 +1312,7 @@ try {
     console.log(`   Processed ${allCommunityResults.length} communities in total.`);
 
     reportWrite(fs, path.join(OUTPUT_DIR, "community_analysis.html"), () => renderReport(allCommunityResults, reportDetails));
+    contextWrite(fs, path.join(OUTPUT_DIR, CONTEXT_FILE), () => buildContext(allCommunityResults, reportDetails, contextInputs));
 
 } catch (error) {
     console.error("❌ Fatal Error:", error.message);

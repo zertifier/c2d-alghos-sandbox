@@ -419,7 +419,7 @@ function contextDoc({ title, summary = '', run = [], files = [], fields = [], me
     out.push('');
     out.push('> This file explains the outputs of one Compute-to-Data job of the Empower-X data space, ' +
         'so that an AI assistant (or a person) can answer questions about them. ' +
-        'All numbers below come from this run. Identifiers of supply points (CUPS) and people are shortened for privacy.');
+        'All numbers below come from this run. Where the data contains identifiers of supply points (CUPS), cars or people, they are shortened here for privacy.');
     out.push('');
     out.push('## 1. What this algorithm does'); out.push(''); out.push(mdText(summary)); out.push('');
     out.push('## 2. This run'); out.push(''); out.push(mdTable([{ key: 'label', label: 'Item' }, { key: 'value', label: 'Value' }], run));
@@ -1370,6 +1370,9 @@ function pickConsumption(cols) {
 }
 const isWh = name => /wh$/i.test(name) && !/kwh$/i.test(name);
 
+// Facts about each input file, collected only for AI_CONTEXT.md (never used for the results).
+const CTX_INPUT = new Map();
+
 /** Any supported file → Map(cups → [{y,m,d,h,kwh}]) */
 function readDataset(file) {
   const text = fs.readFileSync(file, 'utf8').replace(/^﻿/, '');
@@ -1398,6 +1401,7 @@ function readDataset(file) {
     const cCons = cols[iCons], k = isWh(cCons) ? 0.001 : 1;
     for (const r of rows) add(cCups ? String(r[cCups]) : null, parseWhen(r[cTime]), toNum(r[cCons]) * k);
     log(`${path.basename(file)}: JSON, ${rows.length} rows, consumption from "${cCons}"`);
+    CTX_INPUT.set(file, { format: 'JSON', rows: rows.length, column: cCons, wh: k !== 1, idColumn: cCups || null, timeColumn: cTime });
     return out;
   }
   const lines = text.split(/\r?\n/).filter(l => l.trim());
@@ -1411,6 +1415,7 @@ function readDataset(file) {
     const parsed = C.parseConsumptionCsv(text);
     if (!parsed) return out;
     for (const r of parsed.records) add(null, { y: 0, m: r.m, d: r.d, h: parsed.oneBased ? r.hour - 1 : r.hour }, r.value * parsed.scale);
+    CTX_INPUT.set(file, { format: 'CSV without header', rows: parsed.records.length, column: null, wh: parsed.scale !== 1, idColumn: null, timeColumn: null, oneBased: parsed.oneBased });
     return out;
   }
   const iTime = header.findIndex(h => RE_TIME.test(h));
@@ -1433,6 +1438,7 @@ function readDataset(file) {
     add(iCups >= 0 ? c[iCups] : null, when, toNum(c[iCons]) * k);
   }
   log(`${path.basename(file)}: CSV, ${lines.length - 1} rows, consumption from "${header[iCons]}"`);
+  CTX_INPUT.set(file, { format: `CSV (separator "${sep.charCodeAt(0) === 9 ? 'tab' : sep}")`, rows: lines.length - 1, column: header[iCons], wh: k !== 1, idColumn: iCups >= 0 ? header[iCups] : null, timeColumn: header[iTime], hourColumn: iHour >= 0 ? header[iHour] : null, oneBased });
   return out;
 }
 
@@ -1834,6 +1840,534 @@ function renderReport({ params, summary, single, results }) {
   });
 }
 
+// ---------- AI context (AI_CONTEXT.md) ----------
+// Per-file statistics of the consumption records, collected only for AI_CONTEXT.md.
+const CTX_SUPPLY = new Map();
+function ctxTrack(file, id, key, recs, covered) {
+  try {
+    let s = CTX_SUPPLY.get(file);
+    if (!s) {
+      s = { ids: 0, kept: 0, dropped: 0, renamed: 0, records: 0, negative: 0, feb29: 0, maxKwh: null, minDate: null, maxDate: null, years: new Set() };
+      CTX_SUPPLY.set(file, s);
+    }
+    s.ids++;
+    if (covered) s.kept++; else s.dropped++;
+    if (key !== id) s.renamed++;
+    s.records += recs.length;
+    for (const r of recs) {
+      if (r.kwh < 0) s.negative++;
+      if (s.maxKwh == null || r.kwh > s.maxKwh) s.maxKwh = r.kwh;
+      if (r.m === 2 && r.d === 29) s.feb29++;
+      const d = r.y * 10000 + r.m * 100 + r.d;
+      if (s.minDate == null || d < s.minDate) s.minDate = d;
+      if (s.maxDate == null || d > s.maxDate) s.maxDate = d;
+      s.years.add(r.y);
+    }
+  } catch (e) { /* context only */ }
+}
+
+function buildContext({ params, summary, single, results, site }) {
+  const multi = results.length > 1;
+  const P = multi ? 'results[]' : 'result';
+  const res = results[0];
+  const errors = summary.errors || [];
+  const nP = params.tariff === '3.0TD' ? 6 : 3;
+  const hasBattery = results.some(x => x.battery);
+  const batteryAsked = params.battery_kwh > 0;
+  const generatedAt = new Date().toISOString();
+  const ymd = d => (d == null ? '?' : Math.floor(d / 10000) ? `${Math.floor(d / 10000)}-${String(Math.floor(d / 100) % 100).padStart(2, '0')}-${String(d % 100).padStart(2, '0')}` : `--${String(Math.floor(d / 100) % 100).padStart(2, '0')}-${String(d % 100).padStart(2, '0')} (no year)`);
+  const short = v => { const s = typeof v === 'string' ? v : JSON.stringify(v); return s.length > 60 ? s.slice(0, 57) + '...' : s; };
+  const coverageOf = x => { const m = /(\d+) of 8760/.exec(x.consumption_source); return m ? Number(m[1]) : null; };
+  const profileLabel = (C.PROFILES[params.profile] && C.PROFILES[params.profile].label) || params.profile;
+  const outFiles = (() => { try { return fs.readdirSync(OUTPUTS).filter(f => f !== CONTEXT_FILE).sort(); } catch (e) { return []; } })();
+  const has = f => outFiles.includes(f);
+
+  // ---- parameters as given ----
+  let raw = {}, rawOk = false, rawPresent = false;
+  try {
+    const file = path.join(INPUTS, CUSTOM);
+    if (fs.existsSync(file)) { rawPresent = true; raw = JSON.parse(fs.readFileSync(file, 'utf8')) || {}; rawOk = true; }
+  } catch (e) { raw = {}; }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) raw = {};
+  const given = new Map();
+  const unknown = [];
+  for (const [k, v] of Object.entries(raw)) {
+    const key = k.trim().toLowerCase();
+    if (key in DEFAULTS || key === 'fields') given.set(key, v); else unknown.push(k);
+  }
+  const notes = [];
+  const invalid = new Set();
+  const NUMERIC = ['latitude', 'longitude', 'panels', 'panel_watts', 'tilt', 'azimuth', 'max_kwp', 'inverter_kw', 'annual_kwh',
+    'compensation_price', 'pv_cost', 'pv_cost_per_kwp', 'subsidy', 'maintenance', 'years', 'battery_kwh',
+    'battery_kw', 'battery_cost', 'battery_life', 'coverage', 'losses', 'taxes', 'inflation', 'degradation', 'battery_efficiency', 'battery_dod'];
+  const SHARES = ['coverage', 'losses', 'taxes', 'inflation', 'degradation', 'battery_efficiency', 'battery_dod'];
+  for (const k of NUMERIC) {
+    if (!given.has(k)) continue;
+    const v = given.get(k);
+    const n = typeof v === 'string' ? parseFloat(v.replace(',', '.')) : Number(v);
+    if (!Number.isFinite(n)) invalid.add(k);
+    if (!Number.isFinite(n)) notes.push(`Parameter ${k} was given as ${short(v)}, which is not a number: the default ${DEFAULTS[k]} was used.`);
+    else if (SHARES.includes(k) && n > 1) notes.push(`Parameter ${k} was given as ${n} and read as a percentage: ${n / 100}.`);
+  }
+  if (given.has('profile') && String(given.get('profile')) !== params.profile) notes.push(`Parameter profile was given as ${short(given.get('profile'))}, which is not a known profile: "habitatge" was used.`);
+  if (given.has('tariff') && !/^\s*[23]\.0\s*TD\s*$/i.test(String(given.get('tariff')))) notes.push(`Parameter tariff was given as ${short(given.get('tariff'))} and interpreted as ${params.tariff}.`);
+  if (given.has('sizing') && !/^\s*(auto|fixed)\s*$/i.test(String(given.get('sizing')))) notes.push(`Parameter sizing was given as ${short(given.get('sizing'))} and interpreted as "${params.sizing}".`);
+  if (given.has('compensation_mode') && !/^\s*(simplificada|virtual)\s*$/i.test(String(given.get('compensation_mode')))) notes.push(`Parameter compensation_mode was given as ${short(given.get('compensation_mode'))} and interpreted as "${params.compensation_mode}".`);
+  if (given.has('fields') && !params.fields) notes.push('Parameter fields was given but is not a list, so it was ignored.');
+  const src = k => (invalid.has(k) ? 'default: the given value was not a number' : given.has(k) ? 'from algoCustomData.json' : 'default');
+  const paramValue = k => {
+    if (k === 'prices') return params.prices.slice(1).map((v, i) => `P${i + 1}=${v}`).join(', ') + ' €/kWh';
+    return short(params[k]);
+  };
+  const paramRows = Object.keys(DEFAULTS).map(k => ({ label: `Parameter ${k}`, value: `${paramValue(k)} (${src(k)})` }));
+  if (params.fields) paramRows.push({ label: 'Parameter fields', value: `${params.fields.length} panel field(s) given explicitly (from algoCustomData.json); they replace panels/panel_watts/tilt/azimuth and the sizing mode` });
+
+  // ---- inputs ----
+  const inputRows = [];
+  let inputRecords = 0, minDate = null, maxDate = null, negatives = 0, feb29 = 0, dropped = 0, renamed = 0;
+  const years = new Set();
+  for (const [file, info] of CTX_INPUT) {
+    const st = CTX_SUPPLY.get(file) || { ids: 0, kept: 0, dropped: 0, renamed: 0, records: 0, negative: 0, feb29: 0, years: new Set() };
+    inputRecords += st.records; negatives += st.negative; feb29 += st.feb29; dropped += st.dropped; renamed += st.renamed;
+    st.years.forEach(y => years.add(y));
+    if (st.minDate != null && (minDate == null || st.minDate < minDate)) minDate = st.minDate;
+    if (st.maxDate != null && (maxDate == null || st.maxDate > maxDate)) maxDate = st.maxDate;
+    inputRows.push({
+      label: `Input file ${path.basename(file)}`,
+      value: `used: ${info.format}, ${info.rows} data rows, ${st.records} rows with a valid time and number, ` +
+        `consumption read from ${info.column ? `"${info.column}"` : 'the first number after the date/hour'}${info.wh ? ' (Wh, divided by 1000)' : ' (kWh)'}` +
+        (info.idColumn ? `, supply-point id from "${info.idColumn}"` : ', no supply-point id column') +
+        (info.timeColumn ? `, time from "${info.timeColumn}"${info.hourColumn ? ` + hour from "${info.hourColumn}"${info.oneBased ? ' (hours 1-24)' : ''}` : ''}` : '') +
+        `; ${st.ids} supply point(s) found, ${st.kept} used` + (st.dropped ? `, ${st.dropped} without any usable hour` : '') +
+        (st.minDate != null ? `; dates ${ymd(st.minDate)} to ${ymd(st.maxDate)}` : ''),
+    });
+  }
+  for (const e of errors) inputRows.push({ label: `Input file ${e.input}`, value: `skipped: ${e.error}` });
+  const standard = /^standard/.test(res.consumption_source);
+  const filesSeen = CTX_INPUT.size + errors.length;
+  // plain-language reading of the consumption_source string (the "rest filled" wording is fixed text)
+  const sourceNote = x => {
+    const c = coverageOf(x);
+    if (c == null) return 'no measured data: standard profile';
+    return c >= 8760 ? 'all 8,760 hours measured; nothing was filled (the words "rest filled with the profile shape" are fixed text)'
+      : `${c} hours measured, the other ${8760 - c} hours filled with the profile shape`;
+  };
+  // weekday shift when input dates of another year are mapped onto the reference year
+  const dowJan1 = y => new Date(Date.UTC(y, 0, 1)).getUTCDay();
+  const DOW = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  const yearShifts = [...years].filter(y => y > 0 && y !== C.YEAR).sort().map(y => {
+    const sh = (dowJan1(C.YEAR) - dowJan1(y) + 7) % 7;
+    return { y, sh, text: `${y}: dates keep their month, day and hour, so weekdays move ${sh} day(s) forward (e.g. 1 January ${y} was a ${DOW[dowJan1(y)]}, 1 January ${C.YEAR} is a ${DOW[dowJan1(C.YEAR)]})` };
+  });
+  // with-battery yearly totals (single installation only; hourly arrays are only kept for one supply point)
+  let batAgg = null;
+  try {
+    if (single && single.battery) {
+      const sb = single.battery, sm = sb.sim, sum_ = a => a.reduce((x, y) => x + y, 0);
+      const cap = params.battery_kwh * params.battery_dod, eta = Math.sqrt(params.battery_efficiency);
+      const lifeSaving = sb.cash.flows.reduce((a, f) => a + f.saving, 0);
+      batAgg = {
+        imp: sum_(sm.imp), exp: sum_(sm.exp), charge: sum_(sm.charge), discharge: sum_(sm.discharge), grid: sum_(sm.gridCharge),
+        energyCost: sb.bill.energyCost, comp: sb.bill.compensation, lost: sb.bill.lost, total: sb.bill.total,
+        cap, eta, lifeSaving, life: Math.round(params.battery_life),
+      };
+    }
+  } catch (e) { batAgg = null; }
+
+  const run = [
+    { label: 'Generated at (UTC)', value: generatedAt },
+    { label: 'Algorithm', value: `${summary.algorithm}, version ${summary.version} (file solar_roi_calculator.js)` },
+    { label: 'Mode', value: multi ? `community: ${results.length} supply points, each simulated separately, results also summed` : (standard ? 'single installation with a standard consumption profile (no usable input data)' : 'single supply point from the input data') },
+    { label: 'Input files (excluding algoCustomData.json)', value: filesSeen ? `${filesSeen} found: ${CTX_INPUT.size} read, ${errors.length} skipped` : 'none' },
+    ...inputRows,
+    { label: 'Consumption rows used (all files)', value: inputRecords },
+    { label: 'Input period covered', value: minDate != null ? `${ymd(minDate)} to ${ymd(maxDate)} (local Europe/Madrid dates)` : 'no input data' },
+    { label: 'Consumption source', value: standard ? `standard "${params.profile}" (${profileLabel}) profile scaled to ${params.annual_kwh} kWh/year` : (multi ? `input data for all ${results.length} supply points` : `${res.consumption_source}, i.e. ${sourceNote(res)}`) },
+    ...(yearShifts.length ? [{ label: 'Input year mapped onto the reference year', value: yearShifts.map(s => s.text).join('; ') + `. Weekends and national holidays are those of ${C.YEAR}.` }] : []),
+    { label: 'Dataset id(s) (DIDS)', value: (() => { try { const d = JSON.parse(process.env.DIDS || '[]'); return Array.isArray(d) && d.length ? d.join(', ') + ' (input files are read from the folder of each dataset)' : 'not given: all files in the input folder were read; the job does not record where they came from beyond their file names'; } catch (e) { return 'not readable'; } })() },
+    { label: 'Supply points simulated', value: results.length },
+    ...(multi ? [] : [{ label: 'Supply point id (shortened)', value: `${shownId(res.supply_point, 1)} (full id in summary.json result.supply_point)` }]),
+    { label: 'Simulated calendar', value: `one reference year ${C.YEAR}, 365 days x 24 hours = 8,760 hours, local clock time (Europe/Madrid); daylight saving only shifts the sun position by one hour in summer, no hours are added or removed` },
+    { label: 'Location used', value: `${summary.site.latitude}, ${summary.site.longitude} (nearest PVGIS grid point ${summary.site.nearest_pvgis_point_km} km away; ${summary.site.horizontal_irradiation_kwh_m2} kWh/m² per year on a flat surface)` },
+    { label: 'algoCustomData.json', value: !rawPresent ? 'not present: all parameters are defaults' : (rawOk ? `read, ${given.size} known parameter(s) set` + (unknown.length ? `, ${unknown.length} unknown key(s) ignored` : '') : 'present but not valid JSON: all parameters are defaults') },
+    ...paramRows,
+  ];
+
+  // ---- output files ----
+  const DESCR = {
+    'summary.json': { format: 'JSON', contents: multi ? 'Site, assumptions, community totals, one result object per supply point (results[]), skipped input files.' : 'Site, assumptions, the full result of the single installation (result), skipped input files.' },
+    'typical_day.csv': { format: 'CSV, 288 rows', contents: 'Average day of each month (12 months x 24 hours): production, consumption, grid import and battery discharge in kWh per hour.' },
+    'cashflow.csv': { format: `CSV, ${Math.round(params.years) + 1} rows`, contents: 'Year-by-year net saving and cumulative cash position from year 0 (minus the investment) to the last year analysed.' },
+    'hourly.csv': { format: 'CSV, 8,760 rows', contents: `Every hour of the reference year ${C.YEAR}: tariff period, production, consumption, grid import/export` + (single && single.battery ? ', battery state and flows.' : '.') },
+    'results.csv': { format: `CSV, ${results.length} rows`, contents: 'One row per supply point (full ids) with the main energy and money results. Row number n = supply point #n in the HTML report.' },
+    'solar_report.html': { format: 'HTML', contents: 'Human-readable report with charts and tables (supply-point ids shortened).' },
+  };
+  const files = outFiles.map(f => ({ file: f, format: (DESCR[f] || {}).format || 'other', contents: (DESCR[f] || {}).contents || 'Not described.' }));
+
+  // ---- fields ----
+  const fields = [];
+  const F = (file, field, type, unit, meaning) => fields.push({ file, field, type, unit, meaning });
+  const S = 'summary.json';
+  F(S, 'algorithm', 'string', '', 'Algorithm name.');
+  F(S, 'version', 'string', '', 'Algorithm version.');
+  F(S, 'site.latitude / site.longitude', 'number', 'degrees', 'Location used (parameters latitude/longitude).');
+  F(S, 'site.horizontal_irradiation_kwh_m2', 'number', 'kWh/m² per year', 'Annual global horizontal irradiation (GHI) at the site, interpolated from the PVGIS grid (rounded to 0 decimals).');
+  F(S, 'site.nearest_pvgis_point_km', 'number', 'km', 'Distance to the nearest PVGIS grid point (1 decimal).');
+  F(S, 'assumptions.tariff', 'string', '', 'Access tariff: 2.0TD (3 periods) or 3.0TD (6 periods).');
+  F(S, `assumptions.prices_eur_kwh.P1..P${nP}`, 'number', '€/kWh', 'Energy price per tariff period.');
+  F(S, 'assumptions.compensation.price_eur_kwh', 'number', '€/kWh', 'Price credited for exported (surplus) energy.');
+  F(S, 'assumptions.compensation.mode', 'string', '', '"simplificada" (credit capped monthly at the energy cost) or "virtual" (virtual battery: capped yearly).');
+  F(S, 'assumptions.taxes', 'number', 'fraction', 'Tax rate applied to (energy cost - compensation); 0.21 = 21 %.');
+  F(S, 'assumptions.sizing', 'string', '', '"fixed" (panels x panel_watts) or "auto" (kWp sized to coverage x annual consumption).');
+  F(S, 'assumptions.losses', 'number', 'fraction', 'System losses (cables, inverter, dirt).');
+  F(S, 'assumptions.years', 'number', 'years', 'Analysis period as given (the simulation uses it rounded to a whole number).');
+  F(S, 'assumptions.inflation', 'number', 'fraction per year', 'Yearly increase of energy prices.');
+  F(S, 'assumptions.degradation', 'number', 'fraction per year', 'Yearly loss of panel output.');
+  F(S, 'assumptions.battery', 'object or null', '', 'null without battery; else kwh (kWh), kw (kW), cost_eur (€), life_years (years), arbitrage (boolean). Present whenever battery_kwh is above 0, even if battery_kw = 0 (then no battery is simulated).');
+  F(S, 'assumptions.calendar_year', 'number', '', 'Reference calendar year of the hourly simulation (weekends, holidays, daylight saving).');
+  if (multi) {
+    F(S, 'community.supply_points', 'number', 'count', 'Number of supply points simulated.');
+    F(S, 'community.total_kwp', 'number', 'kWp', 'Sum of installation sizes (2 decimals).');
+    F(S, 'community.production_kwh / consumption_kwh / self_consumed_kwh', 'number', 'kWh per year', 'Sums of the per-supply-point rounded values (0 decimals).');
+    F(S, 'community.energy_cost_without_pv_eur / energy_cost_with_pv_eur', 'number', '€ per year', 'Sums of the per-supply-point energy bills (2 decimals).');
+    F(S, 'community.annual_saving_eur', 'number', '€ per year', 'Sum of first-year bill savings of all supply points (solar only, no battery).');
+    F(S, 'community.net_investment_eur', 'number', '€', 'Sum of net investments (solar only).');
+    F(S, 'community.simple_payback_years', 'number or null', 'years', 'net_investment_eur / annual_saving_eur (1 decimal); null if the saving is not positive. Ignores inflation, degradation and maintenance.');
+  }
+  F(S, `${P}.supply_point`, 'string', '', multi ? 'Full supply-point id (CUPS) as in the input; "#n" is appended when the same id appears again in another file.' : 'Supply-point id: "example" when the standard profile was used, "supply-1" when the input had no id column, otherwise the full CUPS.');
+  F(S, `${P}.consumption_source`, 'string', '', '"standard profile" or "dataset (N of 8760 hours, rest filled with the profile shape)": N = hours of the reference year that had measured data. The wording is fixed: when N = 8760 nothing was filled.' + (multi ? '' : ` In this run: ${sourceNote(res)}.`));
+  F(S, `${P}.installation.kwp`, 'number', 'kWp', 'Peak power of the simulated installation (2 decimals).');
+  F(S, `${P}.installation.fields[]`, 'array of objects', '', 'One object per panel field: panels (count), panel_watts (W), tilt (degrees from horizontal), azimuth (degrees: 0 south, -90 east, +90 west).');
+  F(S, `${P}.energy.production_kwh`, 'number', 'kWh per year', 'Solar production in the first year (0 decimals).');
+  F(S, `${P}.energy.specific_yield_kwh_per_kwp`, 'number', 'kWh/kWp per year', 'production / kWp.');
+  F(S, `${P}.energy.consumption_kwh`, 'number', 'kWh per year', 'Annual consumption used in the simulation (input data with gaps filled, or the standard profile).');
+  F(S, `${P}.energy.self_consumed_kwh`, 'number', 'kWh per year', 'Solar energy used on site at the moment it is produced (solar only, no battery) = production - exported.');
+  F(S, `${P}.energy.exported_kwh`, 'number', 'kWh per year', 'Solar surplus sent to the grid (solar only).');
+  F(S, `${P}.energy.grid_import_kwh`, 'number', 'kWh per year', 'Energy still bought from the grid with solar (solar only).');
+  F(S, `${P}.energy.self_consumption_ratio`, 'number', 'fraction 0-1', 'self_consumed / production (3 decimals).');
+  F(S, `${P}.energy.self_sufficiency_ratio`, 'number', 'fraction 0-1', 'self_consumed / consumption (3 decimals), solar only.');
+  F(S, `${P}.bill.energy_cost_without_pv_eur`, 'number', '€ per year', 'Energy term of the bill without solar, taxes included (2 decimals).');
+  F(S, `${P}.bill.energy_cost_with_pv_eur`, 'number', '€ per year', 'Energy term with solar = (energy bought - compensation) x (1 + taxes).');
+  F(S, `${P}.bill.compensation_eur`, 'number', '€ per year', 'Credit for exported energy actually applied (before taxes).');
+  F(S, `${P}.bill.surplus_not_compensated_eur`, 'number', '€ per year', 'Value of exported energy that could not be credited because of the compensation cap.');
+  F(S, `${P}.bill.periods.P1..P${nP}.consumption_kwh`, 'number', 'kWh per year', 'Consumption in that tariff period (1 decimal).');
+  F(S, `${P}.bill.periods.Pn.grid_without_pv_kwh / grid_with_pv_kwh`, 'number', 'kWh per year', 'Energy bought in that period without / with solar (1 decimal).');
+  F(S, `${P}.bill.periods.Pn.cost_without_pv_eur / cost_with_pv_eur`, 'number', '€ per year', 'Cost of that energy at the period price, BEFORE compensation and taxes (2 decimals).');
+  if (hasBattery) F(S, `${P}.bill.periods.Pn.grid_with_battery_kwh / cost_with_battery_eur`, 'number', 'kWh / €', 'Same with solar + battery (only when a battery is simulated).');
+  F(S, `${P}.pv_investment.cost_eur`, 'number', '€', 'Installation cost: pv_cost if given (fixed sizing), else kWp x pv_cost_per_kwp (0 decimals).');
+  F(S, `${P}.pv_investment.net_investment_eur`, 'number', '€', 'max(0, cost - subsidy).');
+  F(S, `${P}.pv_investment.annual_saving_eur`, 'number', '€ per year', 'First-year bill saving = bill without solar - bill with solar (taxes included, maintenance NOT deducted).');
+  F(S, `${P}.pv_investment.payback_years`, 'number or null', 'years', 'Year (with fraction) when the cumulative cash flow reaches 0; null = not reached within the analysis period.');
+  F(S, `${P}.pv_investment.roi`, 'number or null', 'fraction', '(sum of yearly net savings - net investment) / net investment over the whole period; 1.5 = 150 %. null when investment is 0.');
+  F(S, `${P}.pv_investment.net_profit_eur`, 'number', '€', 'Sum of yearly net savings over the period - net investment.');
+  F(S, `${P}.pv_investment.first_year_return`, 'number or null', 'fraction', 'annual_saving_eur / net investment (before maintenance).');
+  F(S, `${P}.battery`, 'object or null', '', hasBattery ? 'Battery results (null for supply points without battery).' : 'null: no battery simulated in this run.');
+  if (hasBattery) {
+    F(S, `${P}.battery.extra_annual_saving_eur`, 'number', '€ per year', 'Bill with solar only - bill with solar + battery (first year).');
+    F(S, `${P}.battery.total_annual_saving_eur`, 'number', '€ per year', 'Bill without solar - bill with solar + battery.');
+    F(S, `${P}.battery.payback_years`, 'number or null', 'years', 'Payback of the battery cost from its extra saving alone (within battery_life, 2 %/year capacity fade, no maintenance). null = the summed extra savings over the battery life never reach battery_cost.');
+    F(S, `${P}.battery.roi`, 'number or null', 'fraction', 'Battery-only ROI over its life = (sum of the yearly extra savings over battery_life years - battery_cost) / battery_cost; -1 would mean nothing is recovered.');
+    F(S, `${P}.battery.cycles_per_year`, 'number', 'cycles', 'Equivalent full cycles per year = energy charged into the battery (solar + grid) x one-way efficiency sqrt(battery_efficiency) / usable capacity (battery_kwh x battery_dod), 0 decimals.' + (batAgg ? ` In this run: ${round(batAgg.charge, 1)} kWh x ${round(batAgg.eta, 3)} / ${round(batAgg.cap, 2)} kWh = ${round(batAgg.charge * batAgg.eta / batAgg.cap, 1)}.` : ''));
+    F(S, `${P}.battery.self_sufficiency_ratio`, 'number', 'fraction 0-1', '1 - grid import / consumption with solar + battery.');
+    F(S, `${P}.battery.grid_charged_kwh`, 'number', 'kWh per year', 'Energy charged from the grid (only with battery_arbitrage).');
+    F(S, `${P}.battery.pv_plus_battery_payback_years / pv_plus_battery_roi`, 'number or null', 'years / fraction', 'Payback and ROI of solar + battery together (after the battery life the saving falls back to solar only).');
+  }
+  if (errors.length) F(S, 'errors[]', 'array of objects', '', 'Input files that could not be used: input (file name), error (reason).');
+  F(S, 'elapsed_seconds', 'number', 's', 'Run time of the job.');
+  if (has('typical_day.csv')) {
+    const T = 'typical_day.csv';
+    F(T, 'month', 'integer', '1-12', 'Month of the reference year.');
+    F(T, 'hour', 'integer', '0-23', 'Local clock hour (start of the hour).');
+    F(T, 'production_kwh', 'number (4 decimals)', 'kWh in that hour', 'Average solar production in that hour over the days of the month.');
+    F(T, 'consumption_kwh', 'number (4 decimals)', 'kWh in that hour', 'Average consumption.');
+    F(T, 'grid_import_kwh', 'number (4 decimals)', 'kWh in that hour', single && single.battery ? 'Average energy bought from the grid WITH solar + battery.' : 'Average energy bought from the grid with solar.');
+    F(T, 'battery_discharge_kwh', 'number (4 decimals)', 'kWh in that hour', single && single.battery ? 'Average battery discharge.' : 'Always 0 (no battery in this run).');
+  }
+  if (has('cashflow.csv')) {
+    const T = 'cashflow.csv';
+    F(T, 'year', 'integer', 'year', '0 = day of the investment, then 1..years.');
+    F(T, 'pv_saving_eur', 'number (2 decimals)', '€', 'Net saving that year (solar only) = first-year saving x (1-degradation)^(year-1) x (1+inflation)^(year-1) - maintenance. 0 in year 0.');
+    F(T, 'pv_cumulative_eur', 'number (2 decimals)', '€', 'Cumulative position: -net investment in year 0, then + each year\'s net saving. Turns positive at the payback.');
+    if (single && single.battery) {
+      F(T, 'pv_battery_saving_eur', 'number (2 decimals)', '€', `Net saving that year with solar + battery. After year ${Math.round(params.battery_life)} (battery_life) the battery is assumed dead and not replaced, so from then on this column equals pv_saving_eur.`);
+      F(T, 'pv_battery_cumulative_eur', 'number (2 decimals)', '€', 'Cumulative position of solar + battery, starting at -(net investment + battery cost).');
+    }
+  }
+  if (has('hourly.csv')) {
+    const T = 'hourly.csv';
+    F(T, 'local_datetime', 'string', 'YYYY-MM-DDTHH:00', `Local clock time (Europe/Madrid) in the reference year ${C.YEAR}; every day has exactly 24 rows (365 x 24 = 8,760). Daylight saving is used only to place the sun one clock hour later in summer; the 23-hour day in March and the 25-hour day in October are NOT represented (no missing or repeated rows).`);
+    F(T, 'period', 'string', 'P1..P' + nP, `${params.tariff} tariff period of that hour (P1 most expensive).`);
+    F(T, 'production_kwh', 'number (4 decimals)', 'kWh', 'Solar production in that hour.');
+    F(T, 'consumption_kwh', 'number (4 decimals)', 'kWh', 'Consumption in that hour.');
+    F(T, 'grid_import_kwh / grid_export_kwh', 'number (4 decimals)', 'kWh', single && single.battery ? 'Bought from / sent to the grid WITH solar + battery.' : 'Bought from / sent to the grid with solar.');
+    if (single && single.battery) {
+      F(T, 'battery_soc_kwh', 'number (4 decimals)', 'kWh', 'Usable energy stored at the end of the hour (starts at 50 % of usable capacity).');
+      F(T, 'battery_charge_kwh / battery_discharge_kwh', 'number (4 decimals)', 'kWh', 'Energy into (from solar, plus grid with arbitrage) / out of the battery in that hour.');
+    }
+  }
+  if (has('results.csv')) {
+    const T = 'results.csv';
+    F(T, 'supply_point', 'string (double-quoted)', '', 'Full supply-point id, same as summary.json results[].supply_point. Row n = "#n" in the HTML report.');
+    F(T, 'kwp, production_kwh, consumption_kwh', 'number', 'kWp, kWh/year', 'As installation.kwp and energy.* in summary.json.');
+    F(T, 'self_consumption_ratio, self_sufficiency_ratio', 'number', 'fraction 0-1', 'As energy.* in summary.json (solar only).');
+    F(T, 'cost_without_pv_eur, cost_with_pv_eur', 'number', '€/year', 'As bill.energy_cost_without_pv_eur / energy_cost_with_pv_eur.');
+    F(T, 'annual_saving_eur, net_investment_eur', 'number', '€/year, €', 'As pv_investment.*.');
+    F(T, 'payback_years', 'number or empty', 'years', 'Empty = never pays back within the period.');
+    F(T, 'roi', 'number or empty', 'fraction', 'As pv_investment.roi.');
+    if (batteryAsked) F(T, 'battery_extra_saving_eur, battery_payback_years', 'number or empty', '€/year, years', hasBattery ? 'As battery.extra_annual_saving_eur / battery.payback_years.' : 'Header present but rows have no values (battery_kw is 0, so no battery was simulated).');
+  }
+  if (has('solar_report.html')) F('solar_report.html', '(page)', 'HTML', '', 'Same numbers as summary.json, rounded for display; supply-point ids shortened as "#n ES00…ABCD".');
+
+  // ---- method ----
+  const method = [
+    `Solar production: hour by hour for the reference year ${C.YEAR} (365 days x 24 = 8,760 hours in local clock time; in the daylight-saving months the sun is placed one clock hour later, but no hour is skipped or repeated), in 15-minute sub-steps. Monthly GHI and temperature come from the PVGIS 2011-2020 grid (no horizon shading) interpolated at the site; daily and hourly irradiance are derived with standard clear-sky ratios (Erbs diffuse fraction, Collares-Pereira/Rabl hourly split), transposed to the panel plane (POA) with the HDKR (Hay-Davies-Klucher-Reindl) model and ground albedo 0.2.`,
+    'Production per hour = kWp x effective irradiance x temperature factor x (1 - losses) x 0.972 calibration (cell temperature from NOCT 45 °C, -0.37 %/°C; reflection loss on beam light). If inverter_kw is above 0 the hourly output is capped at it.',
+    params.fields ? 'Installation: the panel fields given in the "fields" parameter.' : params.sizing === 'auto'
+      ? `Installation (auto sizing): kWp = min(max_kwp, coverage x annual consumption / specific yield of 1 kWp), rounded to whole panels of ${params.panel_watts} W (at least 1).`
+      : `Installation (fixed sizing): panels x panel_watts = ${params.panels} x ${params.panel_watts} W.`,
+    'Consumption from data: 15-minute rows of the same hour are added up; the same calendar hour in different years is averaged; 29 February is ignored; hours with no data are filled with the shape of the standard profile, scaled so that the filled hours match the level of the measured ones. Without usable data a standard profile scaled to annual_kwh is used.',
+    'Solar only: each hour, self-consumed = min(production, consumption); surplus = production - consumption (exported); grid import = consumption - production when positive.',
+    'Battery (if battery_kwh and battery_kw are both above 0): usable capacity = battery_kwh x battery_dod; charge/discharge limited to battery_kw; one-way efficiency = sqrt(battery_efficiency); starts at 50 %. Surplus charges first, deficit discharges first. With battery_arbitrage the battery also charges from the grid in the night valley hours when the next day\'s expensive-hour deficit makes it worthwhile.',
+    'Bill (energy term only, no power term, meter rental or VAT unless "taxes" is set): energy bought x period price. Compensation each month = exported kWh x compensation_price, capped at that month\'s energy cost (simplificada) or capped over the year (virtual). Bill = (energy cost - compensation) x (1 + taxes).',
+    `Tariff periods ${params.tariff}: ` + (params.tariff === '3.0TD'
+      ? 'P6 at night (0-8 h), weekends and national holidays; otherwise peak hours (9-14 h, 18-22 h) and other hours get P1..P5 depending on the month season.'
+      : 'P3 from 0 to 8 h, weekends and national holidays; P1 10-14 h and 18-22 h on working days; P2 the rest.'),
+    'Annual saving (first year) = bill without solar - bill with solar. Self-consumption ratio = self-consumed / production. Self-sufficiency ratio = self-consumed / consumption.',
+    'Cash flow: year 0 = -net investment (cost - subsidy, not below 0). Net saving in year y = first-year saving x (1 - degradation)^(y-1) x (1 + inflation)^(y-1) - maintenance. Payback = first year where the cumulative reaches 0 or more, interpolated within that year: (year - 1) + (-cumulative at end of previous year) / net saving of that year (e.g. 7.4). ROI = (sum of net savings - investment) / investment. Net profit = sum of net savings - investment. First-year return = first-year saving (before maintenance) / investment.',
+    'No discounting: ROI, net profit and payback are plain sums of future euros (no interest rate, no NPV or IRR). Money received in year 20 counts the same as money today, so the results look better than a discounted analysis would.',
+    'Battery economics: extra saving = bill with solar only - bill with solar + battery (first year). Battery payback/ROI use only this extra saving, over battery_life years, growing with inflation and shrinking with a fixed 2 %/year fade, no maintenance, investment = battery_cost (no subsidy). Solar + battery: investment = net solar investment + battery_cost; saving = bill without solar - bill with solar + battery (with panel degradation, inflation and maintenance) until the battery life ends, then the solar-only saving (battery not replaced).',
+    'Battery cycles per year = energy charged into the battery x sqrt(battery_efficiency) / (battery_kwh x battery_dod). Self-sufficiency with battery = 1 - grid import with battery / consumption.',
+    multi ? 'Community totals add up the rounded per-supply-point values; simple payback = total net investment / total annual saving. The HTML shows community self-sufficiency = self_consumed / consumption and self-consumption = self_consumed / production computed from these totals. No energy sharing between supply points is simulated.' : 'Single installation: no community totals.',
+    'Rounding in summary.json: energy totals 0 decimals, per-period kWh 1 decimal, euros 2 decimals (investment and net profit 0), ratios 3 decimals, payback 1 decimal. CSV values have 4 (energy) or 2 (euros) decimals. Totals recomputed from CSV rows can differ slightly from summary.json.',
+  ];
+
+  // ---- results ----
+  const results_ = [];
+  const R = (label, value, unit = '') => results_.push({ label, value: value == null ? 'not reached / n.a.' : value, unit });
+  if (!multi) {
+    const e = res.energy, inv = res.pv_investment, b = res.bill, bat = res.battery;
+    R('Installation size', res.installation.kwp, 'kWp');
+    R('Panels', res.installation.fields.map(f => `${f.panels} x ${f.panel_watts} W, tilt ${f.tilt}°, azimuth ${f.azimuth}°`).join(' + '));
+    R('Annual solar production', e.production_kwh, 'kWh');
+    R('Specific yield', e.specific_yield_kwh_per_kwp, 'kWh/kWp');
+    R('Annual consumption', e.consumption_kwh, 'kWh');
+    R('Self-consumed solar', e.self_consumed_kwh, 'kWh');
+    R('Exported surplus', e.exported_kwh, 'kWh');
+    R('Bought from grid with solar', e.grid_import_kwh, 'kWh');
+    R('Self-consumption ratio', e.self_consumption_ratio, 'fraction');
+    R('Self-sufficiency ratio (solar only)', e.self_sufficiency_ratio, 'fraction');
+    R('Energy bill without solar', b.energy_cost_without_pv_eur, '€/year');
+    R('Energy bill with solar', b.energy_cost_with_pv_eur, '€/year');
+    R('Compensation for exports', b.compensation_eur, '€/year');
+    R('Exports not compensated (cap)', b.surplus_not_compensated_eur, '€/year');
+    R('Installation cost', inv.cost_eur, '€');
+    R('Net investment', inv.net_investment_eur, '€');
+    R('First-year saving', inv.annual_saving_eur, '€/year');
+    R('Payback', inv.payback_years, 'years');
+    R(`Net profit over ${Math.round(params.years)} years`, inv.net_profit_eur, '€');
+    R('ROI over the period', inv.roi, 'fraction');
+    R('First-year return', inv.first_year_return, 'fraction');
+    if (bat) {
+      if (batAgg) {
+        R('Energy bill with solar + battery', round(batAgg.total), '€/year');
+        R('  of which energy bought with battery (before compensation)', round(batAgg.energyCost), '€/year');
+        R('  compensation applied with battery', round(batAgg.comp), '€/year');
+        R('Bought from grid with solar + battery', round(batAgg.imp, 0), 'kWh/year');
+        R('Exported with solar + battery', round(batAgg.exp, 0), 'kWh/year');
+        R('Charged into the battery (solar + grid)', round(batAgg.charge, 0), 'kWh/year');
+        R('Delivered by the battery to the home', round(batAgg.discharge, 0), 'kWh/year');
+      }
+      R('Battery extra saving', bat.extra_annual_saving_eur, '€/year');
+      R('Total saving solar + battery', bat.total_annual_saving_eur, '€/year');
+      R(`Battery payback (battery alone, within its ${Math.round(params.battery_life)}-year life)`, bat.payback_years, 'years');
+      R('Battery ROI', bat.roi, 'fraction');
+      R('Battery cycles', bat.cycles_per_year, 'per year');
+      R('Self-sufficiency with battery', bat.self_sufficiency_ratio, 'fraction');
+      R('Grid-charged energy', bat.grid_charged_kwh, 'kWh/year');
+      R('Solar + battery payback', bat.pv_plus_battery_payback_years, 'years');
+      R('Solar + battery ROI', bat.pv_plus_battery_roi, 'fraction');
+    }
+    if (single) {
+      try {
+        const sim = single.battery ? single.battery.sim : single.pv.sim;
+        const mo = Array.from({ length: 12 }, () => [0, 0, 0, 0]);
+        C.CAL.forEach((c, i) => { const a = mo[c.m]; a[0] += single.prod[i]; a[1] += single.cons[i]; a[2] += sim.imp[i]; a[3] += sim.exp[i]; });
+        mo.forEach((a, m) => R(`${MONTHS[m]} ${C.YEAR}`, `production ${Math.round(a[0])}, consumption ${Math.round(a[1])}, bought ${Math.round(a[2])}, exported ${Math.round(a[3])}`, 'kWh' + (single.battery ? ' (with battery)' : '')));
+        const best = mo.reduce((bi, a, m) => (a[0] > mo[bi][0] ? m : bi), 0), worst = mo.reduce((bi, a, m) => (a[0] < mo[bi][0] ? m : bi), 0);
+        const sortedP = mo.map(a => a[0]).sort((x, y) => x - y);
+        const near = sortedP[1] - sortedP[0] < 0.02 * sortedP[0] ? ` (close to the next lowest month: ${Math.round(sortedP[1])} kWh)` : '';
+        R('Month with most / least production', `${MONTHS[best]} ${Math.round(mo[best][0])} kWh / ${MONTHS[worst]} ${Math.round(mo[worst][0])} kWh${near}`);
+        R('Production / consumption over the year', single.cons.reduce((a, b) => a + b, 0) ? round(single.prod.reduce((a, b) => a + b, 0) / single.cons.reduce((a, b) => a + b, 0), 2) : null, 'ratio');
+      } catch (e) { /* optional */ }
+    }
+  } else {
+    const cm = summary.community;
+    R('Supply points', cm.supply_points);
+    R('Total installation', cm.total_kwp, 'kWp');
+    R('Total production', cm.production_kwh, 'kWh/year');
+    R('Total consumption', cm.consumption_kwh, 'kWh/year');
+    R('Total self-consumed', cm.self_consumed_kwh, 'kWh/year');
+    R('Community self-sufficiency', cm.consumption_kwh ? round(cm.self_consumed_kwh / cm.consumption_kwh, 3) : null, 'fraction');
+    R('Community self-consumption', cm.production_kwh ? round(cm.self_consumed_kwh / cm.production_kwh, 3) : null, 'fraction');
+    R('Energy bill without solar (sum)', cm.energy_cost_without_pv_eur, '€/year');
+    R('Energy bill with solar (sum)', cm.energy_cost_with_pv_eur, '€/year');
+    R('Annual saving (sum)', cm.annual_saving_eur, '€/year');
+    R('Net investment (sum)', cm.net_investment_eur, '€');
+    R('Simple payback', cm.simple_payback_years, 'years');
+    const pb = results.map(x => x.pv_investment.payback_years).filter(v => v != null);
+    R('Supply points that never pay back', results.length - pb.length);
+    if (pb.length) R('Payback range', `${Math.min(...pb)} to ${Math.max(...pb)}`, 'years');
+    const sv = results.map(x => x.pv_investment.annual_saving_eur).filter(v => v != null);
+    if (sv.length) R('Annual saving range per supply point', `${Math.min(...sv)} to ${Math.max(...sv)}`, '€/year');
+    if (hasBattery) R('Battery extra saving (sum)', round(results.reduce((a, x) => a + (x.battery ? x.battery.extra_annual_saving_eur || 0 : 0), 0)), '€/year');
+    const ranked = results.map((x, i) => ({ x, n: i + 1 })).sort((a, b) => (b.x.pv_investment.annual_saving_eur || 0) - (a.x.pv_investment.annual_saving_eur || 0));
+    ranked.slice(0, 10).forEach(({ x, n }, k) => R(`Top ${k + 1} by saving: ${shownId(x.supply_point, n)}`,
+      `saving ${x.pv_investment.annual_saving_eur} €/year, consumption ${x.energy.consumption_kwh} kWh, ${x.installation.kwp} kWp, payback ${x.pv_investment.payback_years == null ? 'not reached' : x.pv_investment.payback_years + ' years'}`));
+    const byCons = results.map((x, i) => ({ x, n: i + 1 })).sort((a, b) => b.x.energy.consumption_kwh - a.x.energy.consumption_kwh);
+    byCons.slice(0, 5).forEach(({ x, n }, k) => R(`Top ${k + 1} by consumption: ${shownId(x.supply_point, n)}`, x.energy.consumption_kwh, 'kWh/year'));
+  }
+
+  // ---- limitations ----
+  const lim = [];
+  if (standard) lim.push(`No usable consumption data: the results use a standard "${params.profile}" (${profileLabel}) profile scaled to ${params.annual_kwh} kWh/year. They are an example, not the user's real consumption.`);
+  const partial = results.map((x, i) => ({ x, n: i + 1, c: coverageOf(x) })).filter(o => o.c != null && o.c < 8760);
+  if (partial.length) lim.push(`${partial.length} of ${results.length} supply point(s) had data for fewer than 8,760 hours of the year; missing hours were filled with the profile shape (lowest coverage: ${Math.min(...partial.map(o => o.c))} hours = ${round(Math.min(...partial.map(o => o.c)) / 87.6, 1)} %).`);
+  if (errors.length) lim.push(`${errors.length} input file(s) could not be used and were skipped (see section 2 and summary.json errors[]).`);
+  if (dropped) lim.push(`${dropped} supply point id(s) in the input had no row with a valid hour and were left out.`);
+  if (renamed) lim.push(`${renamed} supply point id(s) appeared in more than one input file; each repetition is simulated as a separate supply point with "#n" appended to its id (not merged).`);
+  if (years.size > 1 && !years.has(0)) lim.push(`The input covers several years (${[...years].sort().join(', ')}): the same calendar hour of different years is averaged into one reference year.`);
+  if (feb29) lim.push(`${feb29} input rows fall on 29 February and are ignored (the reference year has 365 days).`);
+  if (negatives) lim.push(`${negatives} input rows have negative consumption values; they were used as they are.`);
+  if (unknown.length) lim.push(`${unknown.length} unknown key(s) in algoCustomData.json were ignored.`);
+  notes.forEach(n => lim.push(n));
+  if (params.fields && results.some(x => x.installation.fields.some(f => !f.panels))) lim.push('At least one panel field has 0 panels (its "panels" value was not a number).');
+  if (results.some(x => !x.installation.kwp)) lim.push('Installation size is 0 kWp for at least one supply point, so there is no production and no saving.');
+  if (params.sizing === 'auto' && params.pv_cost > 0) lim.push('pv_cost is ignored with auto sizing: the cost is kWp x pv_cost_per_kwp.');
+  if (batteryAsked && !hasBattery) lim.push('battery_kwh is set but battery_kw is 0, so no battery was simulated (summary.json assumptions.battery is still filled).');
+  if (single && single.battery) lim.push('The summary energy figures and ratios (energy.*) and bill.energy_cost_with_pv_eur are for solar only (no battery); hourly.csv, typical_day.csv, the monthly rows in section 6 and the HTML monthly/typical-day charts include the battery. Battery results are in result.battery; the with-battery yearly totals and bill are in section 6 (they are not stored as separate fields in summary.json).');
+  if (batAgg && Math.abs(res.battery.extra_annual_saving_eur - res.bill.energy_cost_with_pv_eur) < 0.01) lim.push(`With the battery the energy bill falls to ${round(batAgg.total)} €/year (energy bought ${round(batAgg.energyCost)} € fully offset by ${round(batAgg.comp)} € of compensation). That is why battery.extra_annual_saving_eur (${res.battery.extra_annual_saving_eur}) equals bill.energy_cost_with_pv_eur (${res.bill.energy_cost_with_pv_eur}): the battery can at most remove the remaining solar-only bill. It is not a copy error.`);
+  if (batAgg && res.battery.payback_years == null) lim.push(`The battery alone never pays back: its extra saving (${res.battery.extra_annual_saving_eur} €/year, with 2 %/year fade and inflation) adds up to only ${round(batAgg.lifeSaving)} € over its ${batAgg.life}-year life, against a cost of ${params.battery_cost} € (battery ROI ${res.battery.roi}).`);
+  if (batAgg) lim.push(`The battery is assumed to last ${batAgg.life} years and not to be replaced: in cashflow.csv, from year ${batAgg.life + 1} on, pv_battery_saving_eur equals pv_saving_eur.`);
+  if (!multi && res.energy.consumption_kwh > 0 && res.energy.production_kwh > 1.5 * res.energy.consumption_kwh) lim.push(`Production (${res.energy.production_kwh} kWh) is ${round(res.energy.production_kwh / res.energy.consumption_kwh, 1)} times the consumption (${res.energy.consumption_kwh} kWh): most of the solar energy is exported (self-consumption ${res.energy.self_consumption_ratio}) and paid at only ${params.compensation_price} €/kWh${res.bill.surplus_not_compensated_eur > 0 ? `, and ${res.bill.surplus_not_compensated_eur} €/year of export value is lost to the compensation cap` : ''}. The installation is probably larger than this consumption needs; a smaller one could pay back sooner (not simulated here).`);
+  if (yearShifts.length) lim.push(`Input dates are mapped onto ${C.YEAR} by month, day and hour, so weekdays move (${yearShifts.map(x => `${x.y}: +${x.sh} day(s)`).join(', ')}). A weekend in the input can therefore land on a ${C.YEAR} working day (and the reverse), which slightly changes the tariff period of those hours.`);
+  lim.push('ROI, net profit and payback are not discounted (no interest rate / NPV): they ignore the time value of money.');
+  if (results.some(x => x.pv_investment.payback_years == null)) lim.push(`At least one installation does not pay back within ${Math.round(params.years)} years (payback_years is null / empty).`);
+  lim.push('Production is modelled from long-term average monthly radiation (PVGIS 2011-2020), not measured: no shading, no specific weather year. Real output depends on shading, weather and installation design.');
+  lim.push('The bill covers only the energy term (no power term, meter rental, electricity tax or VAT unless taxes is set). Prices are constant per period and grow with inflation; no hourly market prices.');
+  lim.push(`Everything is simulated in a reference year ${C.YEAR} with its weekends and national holidays (365 days x 24 hours; daylight saving shifts the sun by one clock hour in summer but no hours are added or removed); input dates of other years are mapped onto it by month, day and hour.`);
+  lim.push('The outputs cannot tell the real total bill: the power (capacity) term, meter rental, electricity tax and VAT are not modelled' + (params.taxes ? ` (only a flat tax of ${params.taxes} on the energy term)` : ' (taxes = 0)') + ', and prices are assumed constant per period apart from inflation.');
+  lim.push('Supply-point ids (CUPS) are shortened in this file and in the HTML report; summary.json' + (multi ? ' and results.csv contain' : ' contains') + ' the full ids.');
+  if (multi) lim.push('For communities no hourly files are written (privacy); each supply point has its own installation and there is no energy sharing between them.');
+  if (!params.hourly_output && !multi) lim.push('hourly_output is false, so hourly.csv was not written.');
+
+  // ---- questions ----
+  const q = [];
+  const Q = (question, answer) => q.push({ question, answer });
+  Q('How much will I save per year?', `${S} ${P}.pv_investment.annual_saving_eur (first year, taxes included, before maintenance). Net of maintenance and for later years: cashflow.csv pv_saving_eur` + (multi ? '; community total: community.annual_saving_eur.' : '.'));
+  Q('When does the installation pay for itself?', `${P}.pv_investment.payback_years (years, 1 decimal). null/empty = not within the ${Math.round(params.years)}-year period.` + (has('cashflow.csv') ? ' cashflow.csv: first year where pv_cumulative_eur is 0 or more.' : '') + (multi ? ' Community: community.simple_payback_years (simple division, no inflation/maintenance).' : ''));
+  Q('How much solar energy is produced, in total or in a given month?', `${P}.energy.production_kwh for the year.` + (has('hourly.csv') ? ' For a month, sum production_kwh in hourly.csv for rows whose local_datetime starts with that YYYY-MM (or see section 6).' : has('typical_day.csv') ? ' For a month: sum the 24 production_kwh rows of that month in typical_day.csv and multiply by the days in the month.' : ''));
+  Q('What share of my consumption does solar cover?', `${P}.energy.self_sufficiency_ratio (x100 for %), solar only.` + (hasBattery ? ' With battery: battery.self_sufficiency_ratio.' : ''));
+  Q('How much of the solar energy do I use myself?', `${P}.energy.self_consumption_ratio; the rest is exported (energy.exported_kwh) and credited at compensation_price (bill.compensation_eur, capped: bill.surplus_not_compensated_eur).`);
+  Q('What is my bill before and after, and by tariff period?', `${P}.bill.energy_cost_without_pv_eur and energy_cost_with_pv_eur; per period in ${P}.bill.periods.Pn (costs per period are before compensation and taxes, so they do not add up to the bill exactly).`);
+  Q('What will my real electricity bill be, including VAT and the power term?', 'The outputs cannot tell. bill.* is only the energy term (energy bought x period price - export compensation)' + (params.taxes ? `, with a flat tax of ${params.taxes}` : ', with taxes = 0') + '; the power (capacity) term, meter rental, electricity tax and VAT are not modelled, and weather/shading are long-term averages. Say so instead of presenting bill.energy_cost_with_pv_eur as the full bill.');
+  Q('Is this a good investment?', `Use ${P}.pv_investment: payback_years, roi (x100 = % over the whole period), net_profit_eur, first_year_return. These are undiscounted sums (no interest rate), and the bill covers the energy term only, so present them as estimates.`);
+  if (!multi) Q('Why do I use so little of my own solar production? Is the system too big?', `Compare energy.production_kwh with energy.consumption_kwh and energy.self_consumption_ratio: self-consumption is limited by how much is consumed at the hours the sun shines. The rest is exported (energy.exported_kwh), credited at compensation_price and capped (bill.surplus_not_compensated_eur). Section 6 gives the production / consumption ratio; well above 1 means the array produces more than the home uses.`);
+  Q('Is it worth adding a battery?', hasBattery ? `${P}.battery: extra_annual_saving_eur, payback_years (battery alone) and pv_plus_battery_payback_years / roi vs pv_investment.payback_years / roi.` : 'No battery was simulated in this run (battery_kwh and battery_kw must both be above 0); the outputs cannot answer this.');
+  if (hasBattery) {
+    Q('What is my bill with solar + battery, and how much do I still buy from the grid?', batAgg
+      ? `Not a field in summary.json: bill with battery = bill.energy_cost_with_pv_eur - battery.extra_annual_saving_eur = ${round(batAgg.total)} €/year (section 6). Yearly grid import / export with battery = sum of grid_import_kwh / grid_export_kwh in hourly.csv (${round(batAgg.imp, 0)} / ${round(batAgg.exp, 0)} kWh, section 6). Do not mix with energy.grid_import_kwh, which is solar only.`
+      : `Bill with battery = bill.energy_cost_with_pv_eur - battery.extra_annual_saving_eur for each supply point; per period: bill.periods.Pn.grid_with_battery_kwh / cost_with_battery_eur (before compensation).`);
+    Q('Why does the battery not pay back (or pay back so slowly)?', 'battery.extra_annual_saving_eur is the only money the battery earns; over battery_life years (2 %/year fade, plus inflation) it must exceed battery_cost. If the solar-only bill is already small, the battery cannot save more than that bill. Compare battery.payback_years / roi and pv_plus_battery_payback_years / roi with pv_investment.payback_years / roi.' + (batAgg ? ` In this run the extra savings add up to ${round(batAgg.lifeSaving)} € over ${batAgg.life} years against ${params.battery_cost} €.` : ''));
+    Q('What does battery cycles per year mean?', `battery.cycles_per_year = energy charged into the battery x sqrt(battery_efficiency) / (battery_kwh x battery_dod). It is not charge / capacity or discharge / capacity, which give slightly different numbers.`);
+  }
+  Q('Was my own consumption data used?', `${P}.consumption_source: "standard profile" means no; "dataset (N of 8760 hours...)" means yes, with N measured hours.`);
+  Q('What prices and assumptions were used?', `${S} assumptions.* and section 2 of this file (each parameter with its source: default or algoCustomData.json).`);
+  if (multi) {
+    Q('Which supply point saves / consumes the most?', 'Sort results.csv by annual_saving_eur or consumption_kwh (or summary.json results[]). Full ids are in results.csv/summary.json; the HTML shows them shortened as "#n ES00…ABCD", where n is the row number in results.csv. Top lists are in section 6.');
+    Q('How many supply points never pay back?', 'Count rows of results.csv with an empty payback_years (see section 6).');
+  } else {
+    Q('When during the day do I buy from the grid (e.g. in winter)?', has('typical_day.csv') ? 'typical_day.csv: filter month (e.g. 12 for December) and read grid_import_kwh for hours 0-23 (average kWh in that hour per day' + (single && single.battery ? ', with battery' : '') + '); the hours with the largest values are when you buy most. hourly.csv has every individual hour.' : 'Not available in this run.');
+    Q('How much is produced in a given month, and which month produces most?', 'Section 6 lists each month (production, consumption, bought, exported) and the best / worst month. From the files: sum production_kwh of hourly.csv rows whose local_datetime starts with YYYY-MM.');
+    Q('How much money will I have made after N years?', has('cashflow.csv') ? 'cashflow.csv pv_cumulative_eur at year = N (negative = investment not yet recovered).' : 'Not available.');
+  }
+
+  const glossary = [
+    { term: 'CUPS', meaning: 'Código Universal del Punto de Suministro: the unique id of an electricity supply point (meter) in Spain, "ES" followed by 16 digits and 2-4 check characters; personal data, so shortened here as "ES00…" + last 4 characters.' },
+    { term: 'Supply point', meaning: 'One electricity connection/meter; each one gets its own simulated solar installation.' },
+    { term: 'kWp', meaning: 'Kilowatt-peak: nominal power of the panels under standard test conditions (panels x watts / 1000).' },
+    { term: 'kWh', meaning: 'Kilowatt-hour, the unit of electrical energy on the bill.' },
+    { term: 'Specific yield', meaning: 'kWh produced per year for each kWp installed; depends on location, tilt and orientation.' },
+    { term: 'Self-consumption', meaning: 'Solar energy used on site at the moment it is produced; ratio = self-consumed / production.' },
+    { term: 'Self-sufficiency', meaning: 'Share of the consumption covered by own solar (and battery); ratio = self-consumed / consumption.' },
+    { term: 'Surplus / export', meaning: 'Solar production not used on site, sent to the grid.' },
+    { term: 'Compensation (compensación simplificada)', meaning: 'Spanish net-billing scheme: exported kWh are credited at a fixed price, at most up to the monthly energy cost.' },
+    { term: 'Virtual battery', meaning: 'Retailer scheme where unused export credit carries over; here capped at the yearly energy cost.' },
+    { term: 'GHI', meaning: 'Global horizontal irradiation: solar energy reaching a flat surface (kWh/m²).' },
+    { term: 'POA', meaning: 'Plane-of-array irradiance: solar energy reaching the tilted panel surface.' },
+    { term: 'PVGIS', meaning: 'EU Joint Research Centre solar radiation database used for monthly radiation and temperature.' },
+    { term: 'Tilt / azimuth', meaning: 'Panel angle from horizontal; orientation where 0° = south, -90° = east, +90° = west.' },
+    { term: '2.0TD / 3.0TD', meaning: 'Spanish access tariffs: 2.0TD (up to 15 kW, 3 periods P1 peak, P2 flat, P3 valley) and 3.0TD (over 15 kW, 6 periods).' },
+    { term: 'P1..P6', meaning: 'Tariff periods with different energy prices; P1 is the most expensive.' },
+    { term: 'Payback', meaning: 'Years until the cumulative savings equal the investment.' },
+    { term: 'ROI', meaning: 'Return on investment over the period: (total savings - investment) / investment; 0.93 = 93 % over the whole period, not per year. Not discounted.' },
+    { term: 'NPV / discounting', meaning: 'Valuing future euros less than euros today using an interest rate. NOT applied by this algorithm.' },
+    { term: 'Energy term', meaning: 'Part of the electricity bill that depends on kWh bought; the only part modelled here (no power term, meter rental or VAT).' },
+    { term: 'Equivalent full cycle', meaning: 'Battery use expressed as how many times its usable capacity was filled in a year.' },
+    { term: 'Degradation', meaning: 'Yearly loss of panel output (e.g. 0.5 %/year).' },
+    { term: 'DoD', meaning: 'Depth of discharge: usable share of the battery capacity.' },
+    { term: 'Arbitrage', meaning: 'Charging the battery from the grid in cheap night hours to use the energy in expensive hours.' },
+    { term: 'Standard profile', meaning: 'Typical hourly consumption shape (habitatge = home, teletreball = home office, comerc = shop/office, industria = two-shift industry), based on REE profiles.' },
+  ];
+
+  const facts = {
+    generated_at: generatedAt,
+    algorithm: summary.algorithm, version: summary.version, file: 'solar_roi_calculator.js',
+    mode: multi ? 'community' : 'single',
+    supply_points: results.length,
+    consumption_source: multi ? (standard ? 'standard profile' : 'dataset (per supply point, see summary.json results[].consumption_source)') : res.consumption_source,
+    consumption_kind: standard ? 'standard_profile' : 'input_data',
+    measured_hours: multi ? null : coverageOf(res),
+    input_years_mapped: yearShifts.map(x => ({ year: x.y, weekday_shift_days: x.sh })),
+    input_files_read: CTX_INPUT.size, input_files_skipped: errors.length, input_rows_used: inputRecords,
+    input_period: minDate != null ? { from: ymd(minDate), to: ymd(maxDate) } : null,
+    reference_year: C.YEAR,
+    site: summary.site,
+    parameters: {
+      tariff: params.tariff, prices_eur_kwh: summary.assumptions.prices_eur_kwh, sizing: params.sizing, coverage: params.coverage,
+      panels: params.panels, panel_watts: params.panel_watts, tilt: params.tilt, azimuth: params.azimuth, losses: params.losses,
+      profile: params.profile, annual_kwh: params.annual_kwh, compensation_price: params.compensation_price, compensation_mode: params.compensation_mode,
+      taxes: params.taxes, pv_cost_per_kwp: params.pv_cost_per_kwp, pv_cost: params.pv_cost, subsidy: params.subsidy, maintenance: params.maintenance,
+      inflation: params.inflation, degradation: params.degradation, years: params.years,
+      battery_kwh: params.battery_kwh, battery_kw: params.battery_kw, battery_cost: params.battery_cost, battery_arbitrage: params.battery_arbitrage,
+      set_in_algoCustomData: [...given.keys()],
+    },
+    results: multi ? summary.community : {
+      kwp: res.installation.kwp, production_kwh: res.energy.production_kwh, consumption_kwh: res.energy.consumption_kwh,
+      self_consumption_ratio: res.energy.self_consumption_ratio, self_sufficiency_ratio: res.energy.self_sufficiency_ratio,
+      energy_cost_without_pv_eur: res.bill.energy_cost_without_pv_eur, energy_cost_with_pv_eur: res.bill.energy_cost_with_pv_eur,
+      net_investment_eur: res.pv_investment.net_investment_eur, annual_saving_eur: res.pv_investment.annual_saving_eur,
+      payback_years: res.pv_investment.payback_years, roi: res.pv_investment.roi, net_profit_eur: res.pv_investment.net_profit_eur,
+      battery: res.battery,
+      with_battery: batAgg ? {
+        energy_bill_eur: round(batAgg.total), energy_bought_cost_eur: round(batAgg.energyCost), compensation_eur: round(batAgg.comp),
+        grid_import_kwh: round(batAgg.imp, 0), grid_export_kwh: round(batAgg.exp, 0), battery_charge_kwh: round(batAgg.charge, 0),
+        battery_discharge_kwh: round(batAgg.discharge, 0), battery_extra_savings_over_life_eur: round(batAgg.lifeSaving),
+      } : null,
+      production_to_consumption_ratio: res.energy.consumption_kwh ? round(res.energy.production_kwh / res.energy.consumption_kwh, 2) : null,
+      discounted: false,
+    },
+    output_files: outFiles.concat([CONTEXT_FILE]),
+  };
+
+  return contextDoc({
+    title: 'Solar Production, Savings and ROI Calculator (Zertipower)',
+    summary: 'This Empower-X marketplace algorithm (Zertipower solar calculator) estimates what a rooftop solar installation would produce, how much it would save on the electricity bill and how quickly it pays back. ' +
+      'It simulates every hour of one year for each supply point, using the hourly consumption found in the input files (or a standard profile if there is none), Spanish tariff periods and surplus compensation, and an optional battery. ' +
+      `In this run it simulated ${multi ? `${results.length} supply points (a community)` : 'one installation'}.`,
+    run, files, fields, method, results: results_, limitations: lim, questions: q, glossary, facts,
+  });
+}
+
 // ---------- main ----------
 function main() {
   const started = Date.now();
@@ -1850,6 +2384,7 @@ function main() {
         const key = supplies.has(id) ? `${id}#${supplies.size + 1}` : id;
         const y = hourlyYear(recs, params.profile);
         if (y.coveredHours) supplies.set(key, { hourly: y.hourly, coverage: y.coveredHours });
+        ctxTrack(file, id, key, recs, y.coveredHours);
       }
     } catch (e) {
       log(`Skipping ${file}: ${e.message}`);
@@ -1914,6 +2449,7 @@ function main() {
     fs.writeFileSync(path.join(OUTPUTS, 'results.csv'), [head, ...rows].join('\n') + '\n');
   }
   reportWrite(fs, path.join(OUTPUTS, 'solar_report.html'), () => renderReport({ params, summary, single, results }));
+  contextWrite(fs, path.join(OUTPUTS, CONTEXT_FILE), () => buildContext({ params, summary, single, results, site }));
   log(`Done: ${results.length} supply point(s) in ${summary.elapsed_seconds} s`);
   return 0;
 }
