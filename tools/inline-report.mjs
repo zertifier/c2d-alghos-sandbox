@@ -26,10 +26,12 @@ const blockLf =
 const fileArgs = process.argv.slice(2).filter((a) => !a.startsWith('--'))
 const targets = fileArgs.length
   ? fileArgs.map((f) => path.resolve(f))
-  : fs
-      .readdirSync(path.join(root, 'empower-x'))
-      .filter((f) => f.endsWith('.js'))
-      .map((f) => path.join(root, 'empower-x', f))
+  : ['empower-x', 'zertipower-solar'].flatMap((dir) =>
+      fs
+        .readdirSync(path.join(root, dir))
+        .filter((f) => f.endsWith('.js'))
+        .map((f) => path.join(root, dir, f))
+    )
 
 let stale = 0
 for (const file of targets) {

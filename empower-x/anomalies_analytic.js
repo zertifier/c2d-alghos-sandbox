@@ -362,6 +362,93 @@ function reportWrite(fsModule, filePath, buildHtml) {
         console.error(`HTML report skipped (${err && err.message ? err.message : err})`);
     }
 }
+
+/* ---------------------------------------------------------------------------
+ * AI context file (AI_CONTEXT.md)
+ *
+ * A plain Markdown description of the job's outputs, written for an AI
+ * assistant (or a person) that is handed the extracted outputs folder and asked
+ * questions about it. Every algorithm uses the same section order:
+ *   1 What this algorithm does · 2 This run · 3 Output files · 4 Fields and units
+ *   5 Method and definitions · 6 Key results · 7 Data quality and limitations
+ *   8 How to answer common questions · 9 Glossary
+ * plus a machine-readable "facts" JSON block at the end.
+ * ------------------------------------------------------------------------- */
+
+const CONTEXT_FILE = 'AI_CONTEXT.md';
+
+function mdText(value) {
+    // Single-line, Markdown-safe text (no HTML interpretation, no table breaks).
+    return String(value === null || value === undefined ? '' : value)
+        .replace(/[\r\n]+/g, ' ')
+        .replace(/[<>]/g, (c) => (c === '<' ? '&lt;' : '&gt;'))
+        .replace(/\|/g, '\|')
+        .trim();
+}
+
+function mdTable(columns, rows) {
+    // columns: [{ key, label }] ; rows: objects. Values pass through mdText.
+    if (!rows || !rows.length) return '_None._\n';
+    const head = '| ' + columns.map((c) => mdText(c.label)).join(' | ') + ' |';
+    const sep = '| ' + columns.map(() => '---').join(' | ') + ' |';
+    const body = rows.map((r) => '| ' + columns.map((c) => mdText(r[c.key])).join(' | ') + ' |');
+    return [head, sep, ...body].join('\n') + '\n';
+}
+
+function mdList(items) {
+    if (!items || !items.length) return '_None._\n';
+    return items.map((it) => '- ' + mdText(it)).join('\n') + '\n';
+}
+
+/**
+ * Builds AI_CONTEXT.md.
+ *   title       algorithm name (as on the marketplace)
+ *   summary     2-4 sentences: what it does and for whom
+ *   run         [{ label, value }]  inputs found, record counts, period, parameters used, generated at
+ *   files       [{ file, format, contents }]
+ *   fields      [{ file, field, type, unit, meaning }]  every field/column of every output file
+ *   method      [string]  how each figure is computed (formulas in words)
+ *   results     [{ label, value, unit }]  this run's headline numbers
+ *   limitations [string]  assumptions, data-quality notes, warnings seen in this run
+ *   questions   [{ question, answer }]  where to look / how to compute common answers
+ *   glossary    [{ term, meaning }]
+ *   facts       plain object; serialised as a JSON block for machine reading
+ */
+function contextDoc({ title, summary = '', run = [], files = [], fields = [], method = [], results = [], limitations = [], questions = [], glossary = [], facts = {} }) {
+    const out = [];
+    out.push(`# AI context: ${mdText(title)}`);
+    out.push('');
+    out.push('> This file explains the outputs of one Compute-to-Data job of the Empower-X data space, ' +
+        'so that an AI assistant (or a person) can answer questions about them. ' +
+        'All numbers below come from this run. Identifiers of supply points (CUPS) and people are shortened for privacy.');
+    out.push('');
+    out.push('## 1. What this algorithm does'); out.push(''); out.push(mdText(summary)); out.push('');
+    out.push('## 2. This run'); out.push(''); out.push(mdTable([{ key: 'label', label: 'Item' }, { key: 'value', label: 'Value' }], run));
+    out.push('## 3. Output files'); out.push(''); out.push(mdTable([{ key: 'file', label: 'File' }, { key: 'format', label: 'Format' }, { key: 'contents', label: 'Contents' }],
+        files.concat([{ file: CONTEXT_FILE, format: 'Markdown', contents: 'This description.' }])));
+    out.push('## 4. Fields and units'); out.push('');
+    out.push(mdTable([{ key: 'file', label: 'File' }, { key: 'field', label: 'Field / column' }, { key: 'type', label: 'Type' }, { key: 'unit', label: 'Unit' }, { key: 'meaning', label: 'Meaning' }], fields));
+    out.push('## 5. Method and definitions'); out.push(''); out.push(mdList(method));
+    out.push('## 6. Key results'); out.push('');
+    out.push(mdTable([{ key: 'label', label: 'Result' }, { key: 'value', label: 'Value' }, { key: 'unit', label: 'Unit' }], results));
+    out.push('## 7. Data quality and limitations'); out.push(''); out.push(mdList(limitations));
+    out.push('## 8. How to answer common questions'); out.push('');
+    out.push(questions.length ? questions.map((q) => `**${mdText(q.question)}**  \n${mdText(q.answer)}\n`).join('\n') : '_None._\n');
+    out.push('## 9. Glossary'); out.push(''); out.push(mdTable([{ key: 'term', label: 'Term' }, { key: 'meaning', label: 'Meaning' }], glossary));
+    out.push('## 10. Facts (machine-readable)'); out.push('');
+    out.push('```json'); out.push(JSON.stringify(facts, null, 2)); out.push('```'); out.push('');
+    return out.join('\n');
+}
+
+/** Write AI_CONTEXT.md without ever failing the job. */
+function contextWrite(fsModule, filePath, buildMd) {
+    try {
+        fsModule.writeFileSync(filePath, buildMd());
+        console.log(`AI context written: ${filePath}`);
+    } catch (err) {
+        console.error(`AI context skipped (${err && err.message ? err.message : err})`);
+    }
+}
 // ===== END html-report =====
 
 /* =========================
